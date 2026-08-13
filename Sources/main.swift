@@ -326,11 +326,12 @@ func resolveNpxPath(nodePath: String) -> String? {
 /// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
 func buildProgram() -> [String]? {
     let node = resolveNodePath()
+    // --host 0.0.0.0：允许局域网访问（http://<本机IP>:3080）
     if let dsh = resolveDshLauncher(nodePath: node) {
-        return [node, dsh, "web", "--port", "3080"]
+        return [node, dsh, "web", "--host", "0.0.0.0", "--port", "3080"]
     }
     if let npx = resolveNpxPath(nodePath: node) {
-        return [node, npx, "--yes", "@deepseek-ai/dsh", "web", "--port", "3080"]
+        return [node, npx, "--yes", "@deepseek-ai/dsh", "web", "--host", "0.0.0.0", "--port", "3080"]
     }
     return nil
 }
