@@ -7,6 +7,18 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 
 ![DSH Launcher 菜单栏效果](docs/screenshot.png)
 
+## 安装（DMG 发行版）
+
+从 [Releases](https://github.com/tttnny/DSH-Launcher/releases) 下载 `DSH-Launcher-*.dmg`：
+
+1. 打开 DMG，把 `DSH Launcher.app` 拖进 **Applications**
+2. 首次打开（未签名/未公证，Gatekeeper 会拦截）：Finder 里右键 `DSH Launcher.app` → **打开**；或执行
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/DSH\ Launcher.app
+   ```
+
+要求：Apple Silicon Mac（M1/M2/M3/M4）· macOS 13 或更高 · 装有 Node.js（fnm / nvm / Homebrew 均可）。
+
 ## 构建
 
 ```bash
