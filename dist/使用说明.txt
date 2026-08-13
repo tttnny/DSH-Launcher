@@ -1,0 +1,46 @@
+DSH Launcher — DeepSeek Harness 菜单栏控制 App
+============================================
+
+这是什么
+--------
+把 dsh（DeepSeek Harness 的 Web UI 服务，端口 3080）变成 macOS 菜单栏
+小应用：点一下就能启动/停止服务，不用再开着终端跑 `npx @deepseek-ai/dsh web`，
+支持开机自启。
+
+运行要求
+--------
+· Apple Silicon Mac（M1/M2/M3/M4）· macOS 13 或更高
+· 装有 Node.js（fnm / nvm / Homebrew 安装均可）
+· 首次"启动服务"会自动联网下载 dsh 包（之后走本地缓存）
+
+安装
+----
+1. 解压本 zip
+2. 把 DSH Launcher.app 拖进"应用程序"文件夹
+3. 第一次打开：在 Finder 里对 DSH Launcher.app 右键 → 打开（因为未在
+   App Store 签名，macOS 会拦截双击，右键打开并确认即可，只需一次）
+
+使用
+----
+1. 打开 DSH Launcher，菜单栏出现鲸鱼图标（绿=运行中 / 橙=端口被占用 /
+   红=上次启动失败 / 灰=未运行，图标为官方 dsh 鲸鱼 logo 按状态着色）
+2. 点击鲸鱼图标 → "启动服务"，等状态变绿。若端口被占用，会弹窗告诉你占用者是谁
+3. 点"打开 Web UI"，浏览器访问 http://127.0.0.1:3080 开始使用
+4. 想让菜单栏图标开机就在：勾选"登录时自动启动本 App"。系统可能会弹
+   "允许在后台运行"的提示，点允许即可（这是 macOS 对自启 App 的标准提示，
+   登录时会自动启动本 App）
+5. 退出 App 时会同时停止服务（数据已落盘，下次点"启动服务"即恢复）
+
+数据与日志
+----------
+· 数据目录：~/.dsh/（会话历史、工作区注册表、API 凭据 .credentials.yaml）
+· 服务日志：~/Library/Logs/DSHLauncher/dsh-web.log
+· 卸载：菜单里没有卸载项，手动删除即可——
+  终端执行 `launchctl bootout gui/$(id -u)/com.dsh.web` 后
+  删除 ~/Library/LaunchAgents/com.dsh.web.plist 和 DSH Launcher.app
+
+常见问题
+--------
+· 鲸鱼图标橙色：端口 3080 被别的进程占用（比如终端里还跑着旧的 dsh web），
+  先停掉那个进程，再点"启动服务"
+· 启动失败：查看 ~/Library/Logs/DSHLauncher/dsh-web.log 找原因
