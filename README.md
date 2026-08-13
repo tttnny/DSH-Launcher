@@ -1,5 +1,7 @@
 # DSH Launcher — DeepSeek Harness 菜单栏 App
 
+[English](README.en.md) | **中文**
+
 macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再需要开着终端**。
 **App 在 → 服务就在：启动 App 自动拉起服务，退出 App 自动停止服务。**
 点击菜单栏鲸鱼图标（🐋 绿=运行中 / 橙=端口被外部占用 / 红=启动失败 / 灰=未运行，图标为官方 dsh 鲸鱼 logo 按状态着色）即可控制。

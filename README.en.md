@@ -1,0 +1,72 @@
+# DSH Launcher — Menu Bar App for DeepSeek Harness
+
+[中文](README.md) | **English**
+
+A macOS menu bar app that hands the `dsh web` service over to launchd — **no terminal required**.
+**App on → service on: launching the app starts the service, quitting stops it.**
+Click the whale icon in the menu bar (🐋 green = running / orange = port occupied externally / red = failed to start / gray = not running; the official dsh whale logo tinted by state) to control it.
+A health check runs 3.5 s after launch; if the process exits, the log tail is shown.
+
+![DSH Launcher menu bar](docs/screenshot.png)
+
+## Install (DMG release)
+
+Download `DSH-Launcher-*.dmg` from the [Releases](https://github.com/tttnny/DSH-Launcher/releases) page:
+
+1. Open the DMG and drag `DSH Launcher.app` into **Applications**
+2. First launch (ad-hoc signed, not notarized — Gatekeeper will block it): right-click `DSH Launcher.app` in Finder → **Open**; or run
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/DSH\ Launcher.app
+   ```
+
+Requirements: Apple Silicon Mac (M1/M2/M3/M4) · macOS 13 or later · Node.js installed (fnm / nvm / Homebrew all fine).
+
+## Build
+
+```bash
+./build.sh        # produces dist/DSH Launcher.app (ad-hoc signed, no developer account needed)
+```
+
+The build output is installed to `~/Applications/DSH Launcher.app`. After changing code, re-run `./build.sh`
+and overwrite with `cp -R dist/DSH\ Launcher.app ~/Applications/`.
+
+## Menu features
+
+| Menu item | Action |
+|---|---|
+| Status line | Whether the service is running (launchd-managed / external instance on port 3080) |
+| Open Web UI (⌘O) | Opens http://127.0.0.1:3080 in the browser |
+| Restart service | Always available: running = restart; failed/stopped = start; port taken by an external instance = dialog explaining who owns it |
+| Launch at login | Shows the menu bar icon and starts the service after login |
+| Open data directory | `~/.dsh` |
+| Quit | Quits the app **and stops the service** (`launchctl bootout`; data is persisted, restored next time the app is opened) |
+
+## Switching from a terminal instance (first use)
+
+Port 3080 may still be held by a `dsh web` running in a terminal (the app shows orange "external instance").
+To switch:
+
+1. Press `Ctrl+C` in the terminal to stop the old `dsh web` (this session goes offline, but history stays in `~/.dsh/sessions/`)
+2. Quit and reopen DSH Launcher (or click **Restart service**) — the service starts automatically
+3. Once the status turns green, click **Open Web UI** — past sessions are fully resumable
+
+## Technical notes
+
+- **Service definition**: `~/Library/LaunchAgents/com.dsh.web.plist` (mode 600),
+  runs `<fnm node> <npx-cached dsh bin.js> web --port 3080` directly, no PATH dependency —
+  because launchd's login environment has no node (your node is a temporary fnm shim).
+- **Launch-at-login definition**: `~/Library/LaunchAgents/com.dsh.menubar.plist` (app auto-start only; the service is never launched at login, `RunAtLoad` is always false — the user starts it manually).
+- **API key**: the harness reads `~/.dsh/.credentials.yaml` directly; no extra configuration needed in the launchd environment.
+- Each "Start service" re-resolves the node path and the latest dsh package path and rewrites the plist —
+  after upgrading dsh (npx cache moves directories) no manual config changes are needed.
+- Stopping the service = `launchctl bootout`; launchd terminates the whole process tree and persists the session.
+- Logs: `~/Library/Logs/DSHLauncher/dsh-web.log`.
+
+## Uninstall
+
+```bash
+launchctl bootout gui/$(id -u)/com.dsh.web 2>/dev/null
+launchctl bootout gui/$(id -u)/com.dsh.menubar 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.dsh.web.plist ~/Library/LaunchAgents/com.dsh.menubar.plist
+rm -rf ~/Applications/DSH\ Launcher.app
+```
