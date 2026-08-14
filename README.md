@@ -9,6 +9,22 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 
 ![DSH Launcher 菜单栏效果](docs/screenshot.png)
 
+## 需要先手动执行 `npx @deepseek-ai/dsh web` 吗？
+
+**不需要。** 使用本 App 的前提只是"机器上装有 Node.js"，不要求你事先手动跑过
+`npx @deepseek-ai/dsh web`：
+
+- Web UI 本身是跑在本机上的服务（http://127.0.0.1:3080），必须有一个
+  `dsh web` 进程在运行才能打开——而这个进程正是**本 App 负责启动和托管**的：
+  点"重启服务"（或 App 启动时自动拉起）会通过 launchd 执行
+  `dsh web --port 3080`。
+- 本机已有 dsh（全局安装或 npx 缓存）时直接复用；完全没有时，首次启动会
+  自动执行 `npx --yes @deepseek-ai/dsh` 联网下载（之后走本地缓存），
+  开箱即用，无需任何手动命令。
+- 反过来要注意：如果你**之前**在终端手动跑过 `npx @deepseek-ai/dsh web`，
+  那个进程会占着 3080 端口，App 会显示橙色"外部实例"；先在终端按
+  `Ctrl+C` 停掉旧进程，再让 App 接管（见下文"从终端实例切换"）。
+
 ## 安装（DMG 发行版）
 
 从 [Releases](https://github.com/tttnny/DSH-Launcher/releases) 下载 `DSH-Launcher-*.dmg`：

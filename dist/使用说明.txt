@@ -7,11 +7,17 @@ DSH Launcher — DeepSeek Harness 菜单栏控制 App
 小应用：点一下就能启动/停止服务，不用再开着终端跑 `npx @deepseek-ai/dsh web`，
 支持开机自启。
 
+注意：使用本 App **不需要**你事先手动执行过 `npx @deepseek-ai/dsh web`。
+Web UI 是一个跑在本机上的服务（浏览器访问 http://127.0.0.1:3080），
+必须要有 `dsh web` 进程在运行才能打开——而这个进程正是 App 自己负责
+启动和托管的，你只管装好 Node.js 就行。
+
 运行要求
 --------
 · Apple Silicon Mac（M1/M2/M3/M4）· macOS 13 或更高
 · 装有 Node.js（fnm / nvm / Homebrew 安装均可）
-· 首次"启动服务"会自动联网下载 dsh 包（之后走本地缓存）
+· 首次"启动服务"会自动联网下载 dsh 包（之后走本地缓存）——
+  无需手动执行任何 dsh 命令
 
 安装
 ----

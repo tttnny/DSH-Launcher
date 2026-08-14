@@ -9,6 +9,23 @@ A health check runs 3.5 s after launch; if the process exits, the log tail is sh
 
 ![DSH Launcher menu bar](docs/screenshot.png)
 
+## Do I need to run `npx @deepseek-ai/dsh web` first?
+
+**No.** The only prerequisite is Node.js on the machine — you do not need to
+have run `npx @deepseek-ai/dsh web` manually:
+
+- The Web UI is a service running on this machine (http://127.0.0.1:3080);
+  a `dsh web` process must be running to open it — and that process is
+  exactly what **this app starts and manages**: clicking "Restart service"
+  (or the auto-start on launch) runs `dsh web --port 3080` under launchd.
+- If dsh is already available (global install or npx cache) it is reused;
+  if not, the first start automatically runs `npx --yes @deepseek-ai/dsh`
+  to download it (cached afterwards). No manual commands needed.
+- Caveat: if you *did* run `npx @deepseek-ai/dsh web` in a terminal before,
+  that process holds port 3080 and the app shows orange "external instance";
+  press `Ctrl+C` there to stop it, then let the app take over
+  (see "Switching from a terminal instance" below).
+
 ## Install (DMG release)
 
 Download `DSH-Launcher-*.dmg` from the [Releases](https://github.com/tttnny/DSH-Launcher/releases) page:
