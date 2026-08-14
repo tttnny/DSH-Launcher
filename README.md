@@ -37,9 +37,14 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 | 状态行 | 服务是否运行（launchd 托管 / 外部实例占用 3080） |
 | 打开 Web UI (⌘O) | 浏览器打开 http://127.0.0.1:3080 |
 | 重启服务 | 永远可用：运行中=重启；启动失败/未运行=直接启动；端口被外部实例占用=弹窗说明占用者 |
+| 远程访问（局域网） | 开启后局域网内其他设备可访问 `http://<本机IP>:3080`，关闭时仅本机；切换后自动重启服务生效 |
+| 复制访问地址 (⌘L) | 复制当前访问地址到剪贴板（远程开启时含本机 IP） |
 | 登录时自动启动本 App | 登录后自动出现菜单栏图标并拉起服务 |
 | 打开数据目录 | `~/.dsh` |
 | 退出 | 退出 App **并停止服务**（`launchctl bootout`，数据已落盘，下次打开 App 即恢复） |
+
+> ⚠️ **远程访问安全提示**：dsh 的 Web UI 可在浏览器里执行命令（远程代码执行能力），
+> 开启远程访问等于把该能力暴露给整个局域网。请仅在可信网络使用，用完建议关闭。
 
 ## 从终端实例切换（第一次使用）
 
@@ -53,8 +58,13 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 ## 技术要点
 
 - **服务定义**：`~/Library/LaunchAgents/com.dsh.web.plist`（600 权限），
-  直接运行 `<fnm node> <npx缓存 dsh bin.js> web --port 3080`，不依赖 PATH——
-  因为 launchd 登录环境里没有 node（你的 node 是 fnm 的临时 shim）。
+  实际运行 `node ~/Library/Application Support/DSHLauncher/forwarder.js`（由 App 每次启动服务时写入），
+  不依赖 PATH——因为 launchd 登录环境里没有 node（你的 node 是 fnm 的临时 shim）。
+- **forwarder 监督 + 局域网转发**：forwarder 以子进程拉起
+  `<fnm node> <npx缓存 dsh bin.js> web --port 3080` 并透传日志（崩溃退出码也透传，
+  供 launchd 记录 last exit code）；远程访问开启时（`--remote`）额外监听
+  `0.0.0.0:3080`，把局域网连接转发到 `127.0.0.1:3080`。dsh 官方出于安全考虑
+  禁止直接绑定 `0.0.0.0`，转发方案不影响本机直连（macOS 按最精确匹配路由）。
 - **自启定义**：`~/Library/LaunchAgents/com.dsh.menubar.plist`（仅 App 自启；服务不做登录自启，`RunAtLoad` 恒为 false，由用户手动启动）。
 - **API key**：harness 直接从 `~/.dsh/.credentials.yaml` 读取，launchd 环境无需额外配置。
 - 每次"启动服务"会重新解析 node 路径与最新的 dsh 包路径并重写 plist，

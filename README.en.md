@@ -37,9 +37,14 @@ and overwrite with `cp -R dist/DSH\ Launcher.app ~/Applications/`.
 | Status line | Whether the service is running (launchd-managed / external instance on port 3080) |
 | Open Web UI (⌘O) | Opens http://127.0.0.1:3080 in the browser |
 | Restart service | Always available: running = restart; failed/stopped = start; port taken by an external instance = dialog explaining who owns it |
+| Remote access (LAN) | When on, other devices on the LAN can open `http://<your-IP>:3080`; when off, local only; toggling restarts the service automatically |
+| Copy access URL (⌘L) | Copies the current access URL to the clipboard (includes the LAN IP when remote access is on) |
 | Launch at login | Shows the menu bar icon and starts the service after login |
 | Open data directory | `~/.dsh` |
 | Quit | Quits the app **and stops the service** (`launchctl bootout`; data is persisted, restored next time the app is opened) |
+
+> ⚠️ **Remote access security note**: dsh's web UI can execute commands from the browser (remote code execution capability);
+> enabling remote access exposes that capability to your whole LAN. Only enable it on trusted networks, and consider turning it off when done.
 
 ## Switching from a terminal instance (first use)
 
@@ -52,9 +57,14 @@ To switch:
 
 ## Technical notes
 
-- **Service definition**: `~/Library/LaunchAgents/com.dsh.web.plist` (mode 600),
-  runs `<fnm node> <npx-cached dsh bin.js> web --port 3080` directly, no PATH dependency —
-  because launchd's login environment has no node (your node is a temporary fnm shim).
+- **Service definition**: `~/Library/LaunchAgents/com.dsh.web.plist` (mode 600)
+  actually runs `node ~/Library/Application Support/DSHLauncher/forwarder.js` (rewritten by the app on every service start),
+  no PATH dependency — because launchd's login environment has no node (your node is a temporary fnm shim).
+- **Forwarder supervisor + LAN forwarding**: the forwarder spawns
+  `<fnm node> <npx-cached dsh bin.js> web --port 3080` as a child with stdio passthrough (its exit code is propagated
+  so launchd records `last exit code`); with remote access enabled (`--remote`) it also listens on `0.0.0.0:3080`
+  and forwards LAN connections to `127.0.0.1:3080`. dsh upstream intentionally refuses binding `0.0.0.0` for safety;
+  this forwarder leaves loopback access untouched (macOS routes by most-specific match).
 - **Launch-at-login definition**: `~/Library/LaunchAgents/com.dsh.menubar.plist` (app auto-start only; the service is never launched at login, `RunAtLoad` is always false — the user starts it manually).
 - **API key**: the harness reads `~/.dsh/.credentials.yaml` directly; no extra configuration needed in the launchd environment.
 - Each "Start service" re-resolves the node path and the latest dsh package path and rewrites the plist —
