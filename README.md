@@ -55,17 +55,21 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 本 App 只托管本机服务（dsh 官方出于安全考虑禁止绑定 `0.0.0.0`，且浏览器
 非安全上下文下部分功能不可用）。局域网访问请使用社区插件
 [moxisuki/dsh-lan](https://github.com/moxisuki/dsh-lan)（已实测兼容 rc.6，
-页面、API、添加工作区均正常）：
+页面、API、添加工作区均正常），安装后**无需改启动命令**：
 
 ```bash
-# 1. 安装插件（本机已装好，链接到 ~/Library/Application Support/DSHLauncher/dsh-lan）
+# 1. 一次性安装插件（本机已装好，链接到 ~/Library/Application Support/DSHLauncher/dsh-lan）
 dsh plugin --profile web add "/Users/$USER/Library/Application Support/DSHLauncher/dsh-lan"
 
-# 2. 启动时挂 overlay（需要先退出本 App 或点“退出”，避免端口冲突）
-dsh web --patch "/Users/$USER/Library/Application Support/DSHLauncher/dsh-lan/cordis.yml"
+# 2. 一次性把 dsh-lan 的 overlay 写进 profile 补丁层（每次 dsh web 启动自动应用）
+cp "/Users/$USER/Library/Application Support/DSHLauncher/dsh-lan/cordis.yml" \
+   "/Users/$USER/.dsh/profiles/web/cordis.patch.yml"
+
+# 3. 重启服务（App 菜单里点“重启服务”即可），启动命令保持 dsh web --port 3080 不变
 ```
 
 启动后按日志打印的 `(LAN: http://<本机IP>:3080)` 地址访问即可。
+想关闭局域网访问：把 `~/.dsh/profiles/web/cordis.patch.yml` 恢复为 `[]` 并重启服务。
 已知限制（上游刻意钉在回环客户端）：设置、凭据、agent 预设编辑在 LAN 下会 403，界面自动降级。
 ⚠️ dsh web 没有认证层，局域网访问会把远程代码执行能力暴露给整个局域网，仅限可信网络使用。
 
