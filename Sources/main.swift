@@ -162,8 +162,6 @@ let homeDir = fs.homeDirectoryForCurrentUser
 let launchAgentsDir = homeDir.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
 let logDir = homeDir.appendingPathComponent("Library/Logs/DSHLauncher", isDirectory: true)
 let logFile = logDir.appendingPathComponent("dsh-web.log")
-let appSupportDir = homeDir.appendingPathComponent("Library/Application Support/DSHLauncher", isDirectory: true)
-let forwarderPath = appSupportDir.appendingPathComponent("forwarder.js")
 let serviceLabel = "com.dsh.web"
 let appLabel = "com.dsh.menubar"
 let servicePlistURL = launchAgentsDir.appendingPathComponent("\(serviceLabel).plist")
@@ -171,35 +169,6 @@ let appPlistURL = launchAgentsDir.appendingPathComponent("\(appLabel).plist")
 let guiDomain = "gui/\(getuid())"
 let webURL = URL(string: "http://127.0.0.1:3080")!
 let defaults = UserDefaults.standard
-
-/// 远程访问（局域网）开关的持久化键
-let remoteAccessKey = "remoteAccessEnabled"
-
-/// 获取本机局域网 IPv4 地址（en0/en1，如 192.168.x.x）；未联网/无网卡时返回 nil
-func lanIPAddress() -> String? {
-    var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
-    defer { freeifaddrs(ifaddr) }
-    for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
-        let interface = ptr.pointee
-        let family = interface.ifa_addr.pointee.sa_family
-        guard family == UInt8(AF_INET) else { continue }
-        let name = String(cString: interface.ifa_name)
-        guard name == "en0" || name == "en1" else { continue }
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        guard getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                          &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
-        let ip = String(cString: host)
-        if !ip.isEmpty { return ip }
-    }
-    return nil
-}
-
-/// 局域网访问地址（开启远程访问时用本机 IP，否则用本地回环）
-func lanAccessURLString() -> String {
-    let host = lanIPAddress() ?? "127.0.0.1"
-    return "http://\(host):3080"
-}
 
 /// 单实例守卫淘汰的重复实例：退出时不应触发“停止服务”
 var isDuplicateExit = false
@@ -353,109 +322,25 @@ func resolveNpxPath(nodePath: String) -> String? {
     return fs.fileExists(atPath: npx) ? npx : nil
 }
 
-/// forwarder.js 源码：以子进程方式启动 dsh web 并透传日志（launchd 直接运行本脚本），
-/// 传 --remote 时额外监听 0.0.0.0:3080 并把局域网连接转发到 127.0.0.1:3080。
-/// dsh 启动命令通过环境变量 DSH_CMD（JSON 数组）传入。
-let forwarderScript = """
-#!/usr/bin/env node
-// DSH Launcher 托管的 dsh web 监督 + 局域网转发器（由 launchd 直接运行）
-// - 以子进程启动 dsh web（官方仅允许绑定 127.0.0.1），stdio 透传进 launchd 日志
-// - 传 --remote 时额外监听 0.0.0.0:3080，把局域网连接转发到 127.0.0.1:3080
-//   （macOS 按最精确匹配路由：本机直连 127.0.0.1 直达 dsh，互不影响）
-const { spawn } = require('node:child_process');
-const net = require('node:net');
-
-const cmd = JSON.parse(process.env.DSH_CMD || '[]');
-if (!Array.isArray(cmd) || cmd.length === 0) {
-  console.error('forwarder: missing DSH_CMD env');
-  process.exit(1);
-}
-
-const child = spawn(cmd[0], cmd.slice(1), { stdio: 'inherit' });
-child.on('error', (err) => {
-  console.error('forwarder: 无法启动 dsh: ' + err.message);
-  process.exit(1);
-});
-
-let server = null;
-if (process.argv.includes('--remote')) {
-  server = net.createServer((src) => {
-    const dst = net.connect(3080, '127.0.0.1', () => {
-      src.pipe(dst);
-      dst.pipe(src);
-    });
-    src.on('error', () => { dst.destroy(); src.destroy(); });
-    dst.on('error', () => { src.destroy(); dst.destroy(); });
-  });
-  server.on('error', (err) => {
-    console.error('forwarder: ' + err.message);
-    child.kill('SIGTERM');
-  });
-  server.listen(3080, '0.0.0.0', () => {
-    console.log('dsh web LAN 转发已开启: 0.0.0.0:3080 -> 127.0.0.1:3080');
-  });
-}
-
-// launchd bootout（停止服务）时转发终止信号，确保 dsh 一起退出
-for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => {
-    child.kill(sig);
-    if (server) server.close();
-    setTimeout(() => process.exit(0), 2000);
-  });
-}
-
-// dsh 退出后本进程也随之退出，退出码沿用子进程，供 launchd 记录 last exit code
-child.on('exit', (code, signal) => {
-  if (server) server.close();
-  if (signal) process.kill(process.pid, signal);
-  process.exit(code === null ? 1 : code);
-});
-"""
-
-/// 把 forwarder.js 写入 Application Support（每次启动服务前更新，保证与 App 版本同步）
-func writeForwarderScript() -> Bool {
-    do {
-        try fs.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
-        try forwarderScript.write(to: forwarderPath, atomically: true, encoding: .utf8)
-        return true
-    } catch {
-        return false
-    }
-}
-
-/// dsh web 的实际启动命令（JSON 数组，经 DSH_CMD 环境变量传给 forwarder.js 执行）。
-/// 注意：dsh 目前只允许绑定 127.0.0.1 —— `--host 0.0.0.0` 会被官方
-/// 以“暴露远程代码执行”为由拒绝，具体局域网 IP 也会被配置校验拦下，
-/// 所以远程访问改由 forwarder.js 在 0.0.0.0:3080 转发实现。
-func dshWebCommandJSON() -> String? {
+/// 生成服务的完整启动命令。
+/// 优先直接跑缓存的 dsh bin.js；没有缓存时退回 `npx --yes @deepseek-ai/dsh`
+/// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
+/// 注意：dsh 只允许绑定 127.0.0.1（官方禁止 `--host 0.0.0.0`），
+/// 局域网访问请安装社区插件 moxisuki/dsh-lan，与本 App 无关。
+func buildProgram() -> [String]? {
     let node = resolveNodePath()
-    var entry: [String]
+    var base: [String]
     if let dsh = resolveDshLauncher(nodePath: node) {
-        entry = [node, dsh]
+        base = [node, dsh]
     } else if let npx = resolveNpxPath(nodePath: node) {
-        entry = [node, npx, "--yes", "@deepseek-ai/dsh"]
+        base = [node, npx, "--yes", "@deepseek-ai/dsh"]
     } else {
         return nil
     }
-    let cmd = entry + ["web", "--port", "3080"]
-    guard let data = try? JSONSerialization.data(withJSONObject: cmd) else { return nil }
-    return String(data: data, encoding: .utf8)
+    return base + ["web", "--port", "3080"]
 }
 
-/// 生成服务的完整启动命令（launchd 直接执行 forwarder.js，由它拉起 dsh）。
-/// 优先直接跑缓存的 dsh bin.js；没有缓存时退回 `npx --yes @deepseek-ai/dsh`
-/// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
-/// 远程访问开启时加 `--remote`（forwarder.js 监听 0.0.0.0:3080 转发到本机）。
-func buildProgram() -> [String]? {
-    let node = resolveNodePath()
-    guard dshWebCommandJSON() != nil else { return nil }
-    guard writeForwarderScript() else { return nil }
-    let remote = defaults.bool(forKey: remoteAccessKey)
-    return [node, forwarderPath.path] + (remote ? ["--remote"] : [])
-}
-
-func servicePlistXML(program: [String], workspace: String, dshCommand: String) -> String {
+func servicePlistXML(program: [String], workspace: String) -> String {
     let argsXML = program.map { "        <string>\(escapeXml($0))</string>" }.joined(separator: "\n")
     return """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -467,11 +352,6 @@ func servicePlistXML(program: [String], workspace: String, dshCommand: String) -
       <array>
     \(argsXML)
       </array>
-      <key>EnvironmentVariables</key>
-      <dict>
-        <key>DSH_CMD</key>
-        <string>\(escapeXml(dshCommand))</string>
-      </dict>
       <key>WorkingDirectory</key><string>\(escapeXml(workspace))</string>
       <key>RunAtLoad</key><false/>
       <key>KeepAlive</key><false/>
@@ -483,10 +363,9 @@ func servicePlistXML(program: [String], workspace: String, dshCommand: String) -
 }
 
 func startService() -> Bool {
-    guard let program = buildProgram(),
-          let dshCommand = dshWebCommandJSON() else { return false }
+    guard let program = buildProgram() else { return false }
     try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
-    guard writePlist(servicePlistURL, servicePlistXML(program: program, workspace: workspacePath(), dshCommand: dshCommand)) else { return false }
+    guard writePlist(servicePlistURL, servicePlistXML(program: program, workspace: workspacePath())) else { return false }
     if serviceLoaded() && !serviceRunning() {
         launchctl(["bootout", "\(guiDomain)/\(serviceLabel)"])
     }
@@ -536,9 +415,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var restartItem: NSMenuItem!
-    private var remoteItem: NSMenuItem!
-    private var lanAddrItem: NSMenuItem!
-    private var copyURLItem: NSMenuItem!
     private var autoAppItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -627,21 +503,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        remoteItem = NSMenuItem(title: "远程访问（局域网）", action: #selector(toggleRemote(_:)), keyEquivalent: "")
-        remoteItem.target = self
-        menu.addItem(remoteItem)
-
-        // 仅远程开启且有局域网 IP 时显示当前访问地址
-        lanAddrItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        lanAddrItem.isEnabled = false
-        menu.addItem(lanAddrItem)
-
-        copyURLItem = NSMenuItem(title: "复制访问地址", action: #selector(copyAccessURL), keyEquivalent: "l")
-        copyURLItem.target = self
-        menu.addItem(copyURLItem)
-
-        menu.addItem(.separator())
-
         autoAppItem = NSMenuItem(title: "登录时自动启动本 App", action: #selector(toggleAutoApp(_:)), keyEquivalent: "")
         autoAppItem.target = self
         menu.addItem(autoAppItem)
@@ -723,47 +584,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { tryStart() }
     }
 
-    /// 远程访问开关：dsh web 官方禁止直接绑定 0.0.0.0，所以开启时改为由
-    /// forwarder.js 额外监听 0.0.0.0:3080 并转发到本机 3080（局域网可访问），
-    /// 关闭时仅本机。切换后若服务在运行，自动重启使配置生效。
-    @objc func toggleRemote(_ item: NSMenuItem) {
-        let on = item.state == .off
-        defaults.set(on, forKey: remoteAccessKey)
-        refresh()
-        if on {
-            if lanIPAddress() == nil {
-                showAlert(title: "未检测到局域网 IP",
-                          message: "看起来当前网络没有可用的局域网地址（en0/en1）。远程访问已开启，但其他设备可能无法连接，请检查 Wi-Fi/网线。")
-            }
-        }
-        if serviceLoaded() || serviceRunning() {
-            doRestart()
-        }
-    }
-
-    /// 复制局域网访问地址到剪贴板：http://<本机IP>:3080
-    @objc func copyAccessURL() {
-        let ip = lanIPAddress()
-        let remoteOn = defaults.bool(forKey: remoteAccessKey)
-        let url: String
-        if remoteOn, let ip = ip {
-            url = "http://\(ip):3080"
-        } else if let ip = ip {
-            url = "http://\(ip):3080"
-        } else {
-            url = "http://127.0.0.1:3080"
-        }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(url, forType: .string)
-        // 菜单项标题短暂变为“已复制”，给用户视觉反馈
-        let original = copyURLItem.title
-        copyURLItem.title = "已复制：\(url) ✓"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-            self?.copyURLItem.title = original
-        }
-    }
-
     @objc func toggleAutoApp(_ item: NSMenuItem) {
         let on = item.state == .off
         if on {
@@ -809,14 +629,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 重启服务永远可用：运行中=重启，失败/未运行=启动，外部占用=弹窗说明
         restartItem.isEnabled = true
         autoAppItem.state = appAutoStartEnabled() ? .on : .off
-        let remoteOn = defaults.bool(forKey: remoteAccessKey)
-        remoteItem.state = remoteOn ? .on : .off
-        if remoteOn, let ip = lanIPAddress() {
-            lanAddrItem.title = "局域网地址：http://\(ip):3080"
-            lanAddrItem.isHidden = false
-        } else {
-            lanAddrItem.isHidden = true
-        }
         updateDot()
     }
 
