@@ -58,11 +58,11 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 页面、API、添加工作区均正常），安装后**无需改启动命令**：
 
 ```bash
-# 1. 一次性安装插件（本机已装好，链接到 ~/Library/Application Support/DSHLauncher/dsh-lan）
-dsh plugin --profile web add "/Users/$USER/Library/Application Support/DSHLauncher/dsh-lan"
+# 1. 一次性安装插件（本机已装好，链接到 ~/.dsh/plugins/dsh-lan）
+dsh plugin --profile web add "/Users/$USER/.dsh/plugins/dsh-lan"
 
 # 2. 一次性把 dsh-lan 的 overlay 写进 profile 补丁层（每次 dsh web 启动自动应用）
-cp "/Users/$USER/Library/Application Support/DSHLauncher/dsh-lan/cordis.yml" \
+cp "/Users/$USER/.dsh/plugins/dsh-lan/cordis.yml" \
    "/Users/$USER/.dsh/profiles/web/cordis.patch.yml"
 
 # 3. 重启服务（App 菜单里点“重启服务”即可），启动命令保持 dsh web --port 3080 不变
