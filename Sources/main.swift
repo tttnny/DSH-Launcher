@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 
 // ============================================================
 // DSH Launcher — DeepSeek Harness 菜单栏控制 App
@@ -169,6 +170,35 @@ let guiDomain = "gui/\(getuid())"
 let webURL = URL(string: "http://127.0.0.1:3080")!
 let defaults = UserDefaults.standard
 
+/// 远程访问（局域网）开关的持久化键
+let remoteAccessKey = "remoteAccessEnabled"
+
+/// 获取本机局域网 IPv4 地址（en0/en1，如 192.168.x.x）；未联网/无网卡时返回 nil
+func lanIPAddress() -> String? {
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+    defer { freeifaddrs(ifaddr) }
+    for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+        let interface = ptr.pointee
+        let family = interface.ifa_addr.pointee.sa_family
+        guard family == UInt8(AF_INET) else { continue }
+        let name = String(cString: interface.ifa_name)
+        guard name == "en0" || name == "en1" else { continue }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                          &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+        let ip = String(cString: host)
+        if !ip.isEmpty { return ip }
+    }
+    return nil
+}
+
+/// 局域网访问地址（开启远程访问时用本机 IP，否则用本地回环）
+func lanAccessURLString() -> String {
+    let host = lanIPAddress() ?? "127.0.0.1"
+    return "http://\(host):3080"
+}
+
 /// 单实例守卫淘汰的重复实例：退出时不应触发“停止服务”
 var isDuplicateExit = false
 
@@ -324,16 +354,21 @@ func resolveNpxPath(nodePath: String) -> String? {
 /// 生成服务的完整启动命令。
 /// 优先直接跑缓存的 dsh bin.js；没有缓存时退回 `npx --yes @deepseek-ai/dsh`
 /// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
+/// 远程访问开启时加 `--host 0.0.0.0`（监听所有网卡，局域网可访问）。
 func buildProgram() -> [String]? {
     let node = resolveNodePath()
-    // --host 0.0.0.0：允许局域网访问（http://<本机IP>:3080）
+    var base: [String]
     if let dsh = resolveDshLauncher(nodePath: node) {
-        return [node, dsh, "web", "--host", "0.0.0.0", "--port", "3080"]
+        base = [node, dsh]
+    } else if let npx = resolveNpxPath(nodePath: node) {
+        base = [node, npx, "--yes", "@deepseek-ai/dsh"]
+    } else {
+        return nil
     }
-    if let npx = resolveNpxPath(nodePath: node) {
-        return [node, npx, "--yes", "@deepseek-ai/dsh", "web", "--host", "0.0.0.0", "--port", "3080"]
+    if defaults.bool(forKey: remoteAccessKey) {
+        return base + ["web", "--host", "0.0.0.0", "--port", "3080"]
     }
-    return nil
+    return base + ["web", "--port", "3080"]
 }
 
 func servicePlistXML(program: [String], workspace: String) -> String {
@@ -411,6 +446,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var restartItem: NSMenuItem!
+    private var remoteItem: NSMenuItem!
+    private var lanAddrItem: NSMenuItem!
+    private var copyURLItem: NSMenuItem!
     private var autoAppItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -499,6 +537,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        remoteItem = NSMenuItem(title: "远程访问（局域网）", action: #selector(toggleRemote(_:)), keyEquivalent: "")
+        remoteItem.target = self
+        menu.addItem(remoteItem)
+
+        // 仅远程开启且有局域网 IP 时显示当前访问地址
+        lanAddrItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        lanAddrItem.isEnabled = false
+        menu.addItem(lanAddrItem)
+
+        copyURLItem = NSMenuItem(title: "复制访问地址", action: #selector(copyAccessURL), keyEquivalent: "l")
+        copyURLItem.target = self
+        menu.addItem(copyURLItem)
+
+        menu.addItem(.separator())
+
         autoAppItem = NSMenuItem(title: "登录时自动启动本 App", action: #selector(toggleAutoApp(_:)), keyEquivalent: "")
         autoAppItem.target = self
         menu.addItem(autoAppItem)
@@ -580,6 +633,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { tryStart() }
     }
 
+    /// 远程访问开关：开启时服务绑定 0.0.0.0（局域网可访问），关闭时仅本机。
+    /// 切换后若服务在运行，自动重启使配置生效。
+    @objc func toggleRemote(_ item: NSMenuItem) {
+        let on = item.state == .off
+        defaults.set(on, forKey: remoteAccessKey)
+        refresh()
+        if on {
+            if lanIPAddress() == nil {
+                showAlert(title: "未检测到局域网 IP",
+                          message: "看起来当前网络没有可用的局域网地址（en0/en1）。远程访问已开启，但其他设备可能无法连接，请检查 Wi-Fi/网线。")
+            }
+        }
+        if serviceLoaded() || serviceRunning() {
+            doRestart()
+        }
+    }
+
+    /// 复制局域网访问地址到剪贴板：http://<本机IP>:3080
+    @objc func copyAccessURL() {
+        let ip = lanIPAddress()
+        let remoteOn = defaults.bool(forKey: remoteAccessKey)
+        let url: String
+        if remoteOn, let ip = ip {
+            url = "http://\(ip):3080"
+        } else if let ip = ip {
+            url = "http://\(ip):3080"
+        } else {
+            url = "http://127.0.0.1:3080"
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(url, forType: .string)
+        // 菜单项标题短暂变为“已复制”，给用户视觉反馈
+        let original = copyURLItem.title
+        copyURLItem.title = "已复制：\(url) ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            self?.copyURLItem.title = original
+        }
+    }
+
     @objc func toggleAutoApp(_ item: NSMenuItem) {
         let on = item.state == .off
         if on {
@@ -625,6 +718,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 重启服务永远可用：运行中=重启，失败/未运行=启动，外部占用=弹窗说明
         restartItem.isEnabled = true
         autoAppItem.state = appAutoStartEnabled() ? .on : .off
+        let remoteOn = defaults.bool(forKey: remoteAccessKey)
+        remoteItem.state = remoteOn ? .on : .off
+        if remoteOn, let ip = lanIPAddress() {
+            lanAddrItem.title = "局域网地址：http://\(ip):3080"
+            lanAddrItem.isHidden = false
+        } else {
+            lanAddrItem.isHidden = true
+        }
         updateDot()
     }
 
