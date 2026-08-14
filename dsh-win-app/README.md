@@ -14,7 +14,7 @@ Windows 系统托盘小应用：把 `dsh web` 服务交给本 App 后台托管�
 
 单文件 exe，无需安装：
 
-1. 下载 `DSH Launcher.exe`（[Releases](https://github.com/tttnny/DSH-Launcher/releases) 或构建产物），
+1. 下载 `DSHLauncher.exe`（[Releases](https://github.com/tttnny/DSH-Launcher/releases) 附件或自行构建），
    放到任意目录（如桌面或 `%LOCALAPPDATA%\DSHLauncher\`）双击运行
 2. 首次运行若出现 SmartScreen 提示：点「更多信息」→「仍要运行」
    （未签名 exe 的常规提示，与 macOS 版 Gatekeeper 拦截同理）

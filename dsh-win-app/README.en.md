@@ -13,7 +13,7 @@ This is the Windows counterpart of the macOS [DSH Launcher](https://github.com/t
 
 Single-file exe, no installation required:
 
-1. Download `DSH Launcher.exe` ([Releases](https://github.com/tttnny/DSH-Launcher/releases) or build it yourself),
+1. Download `DSHLauncher.exe` ([Releases](https://github.com/tttnny/DSH-Launcher/releases) asset or build it yourself),
    put it anywhere (e.g. Desktop or `%LOCALAPPDATA%\DSHLauncher\`) and double-click
 2. First run may show a SmartScreen prompt: click **More info** → **Run anyway**
    (normal for an unsigned exe, same as the Gatekeeper warning on macOS)
