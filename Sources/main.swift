@@ -19,13 +19,19 @@ func escapeXml(_ s: String) -> String {
 }
 
 @discardableResult
-func runProcess(_ launchPath: String, _ args: [String]) -> (code: Int32, out: String, err: String) {
+func runProcess(_ launchPath: String, _ args: [String], timeout: TimeInterval? = nil) -> (code: Int32, out: String, err: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: launchPath)
     p.arguments = args
     let outPipe = Pipe(); let errPipe = Pipe()
     p.standardOutput = outPipe; p.standardError = errPipe
     do { try p.run() } catch { return (-1, "", "spawn failed: \(error.localizedDescription)") }
+    if let timeout {
+        // 防止用户 shell 配置里有交互等待类命令导致启动流程卡死
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+            if p.isRunning { p.terminate() }
+        }
+    }
     p.waitUntilExit()
     let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
@@ -322,6 +328,55 @@ func resolveNpxPath(nodePath: String) -> String? {
     return fs.fileExists(atPath: npx) ? npx : nil
 }
 
+// MARK: - shell 环境继承
+// launchd 拉起的进程只有精简环境（PATH=/usr/bin:/bin:/usr/sbin:/sbin），
+// 用户的 node/pnpm/bun 等工具都配置在 shell 启动文件（.zprofile/.zshrc）里。
+// 因此写 LaunchAgent 前用 `zsh -lic` 抓一次用户完整环境，写入
+// EnvironmentVariables，让 dsh web 服务进程（及其所有子进程）继承终端的全部配置。
+
+/// 抓取用户登录 shell 的完整环境（`zsh -lic` 会读 .zprofile + .zshrc）。
+/// 返回 [:] 表示抓取失败（调用方自行降级）。
+func captureShellEnvironment(timeout: TimeInterval = 8) -> [String: String] {
+    let r = runProcess("/bin/zsh", ["-lic", "env -0"], timeout: timeout)
+    guard r.code == 0 else { return [:] }
+    var env: [String: String] = [:]
+    for chunk in r.out.split(separator: "\0") {
+        guard let eq = chunk.firstIndex(of: "=") else { continue }
+        let key = String(chunk[..<eq])
+        let value = String(chunk[chunk.index(after: eq)...])
+        if key.isEmpty { continue }
+        env[key] = value
+    }
+    // 会话专属/易失变量：PWD 等由 launchd 自设；TERM 由 dsh 的 bash 工具强制覆盖；
+    // FNM_MULTISHELL_PATH 指向的 fnm 临时目录随抓取进程退出即被清理，绝不能写进 plist
+    for junk in ["PWD", "OLDPWD", "SHLVL", "_", "TERM", "FNM_MULTISHELL_PATH"] {
+        env.removeValue(forKey: junk)
+    }
+    return env
+}
+
+/// 修复 PATH：剔除随 shell 会话失效的 fnm multishell 临时目录，
+/// 并保证 node 所在的稳定 bin 目录排在 PATH 最前。
+func repairedPATH(from raw: String, nodeDir: String) -> String {
+    var parts = raw.split(separator: ":").map(String.init)
+    parts.removeAll { $0.contains("fnm_multishells") }
+    if !parts.contains(nodeDir) { parts.insert(nodeDir, at: 0) }
+    return parts.joined(separator: ":")
+}
+
+/// 组装服务进程要继承的环境：抓取 zsh 完整环境并修复 PATH；
+/// 抓取失败时降级为「node bin 目录 + 系统默认 PATH」。
+func serviceEnvironment(nodePath: String) -> [String: String] {
+    let nodeDir = (nodePath as NSString).deletingLastPathComponent
+    var env = captureShellEnvironment()
+    if let path = env["PATH"], !path.isEmpty {
+        env["PATH"] = repairedPATH(from: path, nodeDir: nodeDir)
+    } else {
+        env["PATH"] = "\(nodeDir):/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+    return env
+}
+
 /// 生成服务的完整启动命令。
 /// 优先直接跑缓存的 dsh bin.js；没有缓存时退回 `npx --yes @deepseek-ai/dsh`
 /// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
@@ -340,8 +395,11 @@ func buildProgram() -> [String]? {
     return base + ["web", "--port", "3080"]
 }
 
-func servicePlistXML(program: [String], workspace: String) -> String {
+func servicePlistXML(program: [String], workspace: String, env: [String: String]) -> String {
     let argsXML = program.map { "        <string>\(escapeXml($0))</string>" }.joined(separator: "\n")
+    let envXML = env.keys.sorted()
+        .map { "        <key>\(escapeXml($0))</key><string>\(escapeXml(env[$0]!))</string>" }
+        .joined(separator: "\n")
     return """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -353,6 +411,10 @@ func servicePlistXML(program: [String], workspace: String) -> String {
     \(argsXML)
       </array>
       <key>WorkingDirectory</key><string>\(escapeXml(workspace))</string>
+      <key>EnvironmentVariables</key>
+      <dict>
+    \(envXML)
+      </dict>
       <key>RunAtLoad</key><false/>
       <key>KeepAlive</key><false/>
       <key>StandardOutPath</key><string>\(escapeXml(logFile.path))</string>
@@ -365,7 +427,8 @@ func servicePlistXML(program: [String], workspace: String) -> String {
 func startService() -> Bool {
     guard let program = buildProgram() else { return false }
     try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
-    guard writePlist(servicePlistURL, servicePlistXML(program: program, workspace: workspacePath())) else { return false }
+    let env = serviceEnvironment(nodePath: resolveNodePath())
+    guard writePlist(servicePlistURL, servicePlistXML(program: program, workspace: workspacePath(), env: env)) else { return false }
     if serviceLoaded() && !serviceRunning() {
         launchctl(["bootout", "\(guiDomain)/\(serviceLabel)"])
     }
