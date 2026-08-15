@@ -41,6 +41,30 @@ func runProcess(_ launchPath: String, _ args: [String], timeout: TimeInterval? =
     return (p.terminationStatus, out, err)
 }
 
+/// 执行命令并把 stdout/stderr 实时追加写入日志文件（供安装面板展示进度）。
+/// 返回退出码；调用方从日志文件尾部读取实时输出。
+func runProcessLogging(_ launchPath: String, _ args: [String], timeout: TimeInterval, env: [String: String], logURL: URL) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: launchPath)
+    p.arguments = args
+    p.environment = env
+
+    // 确保日志文件存在，并以追加写模式打开（子进程 stdout/stderr 直接落盘）
+    fs.createFile(atPath: logURL.path, contents: nil)
+    guard let handle = try? FileHandle(forWritingTo: logURL) else { return -1 }
+    handle.seekToEndOfFile()
+    p.standardOutput = handle
+    p.standardError = handle
+
+    do { try p.run() } catch { handle.closeFile(); return -1 }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+        if p.isRunning { p.terminate() }
+    }
+    p.waitUntilExit()
+    handle.closeFile()
+    return p.terminationStatus
+}
+
 // MARK: - dsh 官方鲸鱼图标（菜单栏状态图标）
 // 直接解析打包在 App 内的官方 favicon.svg（DeepSeek Harness 源码
 // apps/web/public/favicon.svg，即 @deepseek-ai/dsh-web-frontend/dist/favicon.svg），
@@ -171,6 +195,7 @@ let homeDir = fs.homeDirectoryForCurrentUser
 let launchAgentsDir = homeDir.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
 let logDir = homeDir.appendingPathComponent("Library/Logs/DSHLauncher", isDirectory: true)
 let logFile = logDir.appendingPathComponent("dsh-web.log")
+let installLogFile = logDir.appendingPathComponent("dsh-install.log")
 let serviceLabel = "com.dsh.web"
 let appLabel = "com.dsh.menubar"
 let servicePlistURL = launchAgentsDir.appendingPathComponent("\(serviceLabel).plist")
@@ -293,6 +318,14 @@ func logTail(_ n: Int = 25) -> String {
     return text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
 }
 
+/// 安装日志尾部，用于安装面板实时展示下载/安装进度
+func installLogTail(_ n: Int = 30) -> String {
+    guard let data = fs.contents(atPath: installLogFile.path),
+          let text = String(data: data, encoding: .utf8) else { return "(等待输出…)" }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "(等待输出…)" : text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
+}
+
 enum ServiceState: Hashable { case running, starting, installing, notInstalled, external, crashed, stopped }
 
 /// 服务正在启动（App 自动拉起 / 手动重启的窗口期），期间状态显示“正在启动”
@@ -348,6 +381,12 @@ func resolveNpxPath(nodePath: String) -> String? {
     let nodeDir = (nodePath as NSString).deletingLastPathComponent
     let npx = "\(nodeDir)/npx"
     return fs.fileExists(atPath: npx) ? npx : nil
+}
+
+func resolveNpmPath(nodePath: String) -> String? {
+    let nodeDir = (nodePath as NSString).deletingLastPathComponent
+    let npm = "\(nodeDir)/npm"
+    return fs.fileExists(atPath: npm) ? npm : nil
 }
 
 // MARK: - shell 环境继承
@@ -828,19 +867,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 安装 dsh（首次使用）
 
-    /// 菜单「安装 dsh」：弹进度面板，后台执行 npx 下载安装，
-    /// 完成后自动拉起服务（无需重启 App）。
+    /// 菜单「安装 dsh」：弹进度面板，后台执行 `npm install -g` 全局安装，
+    /// 完成后自动拉起服务（无需重启 App）。与官方全局安装方式一致，
+    /// 安装后 `which dsh` 可找到，App 的 resolveDshLauncher 也会优先复用全局版。
     @objc func installDsh() {
         guard !installInProgress else { return }
         let node = resolveNodePath()
-        guard let npx = resolveNpxPath(nodePath: node) else {
+        guard let npm = resolveNpmPath(nodePath: node) else {
             showAlert(title: "无法安装 dsh",
-                      message: "未找到 npx（Node.js 可能未安装）。\n\n请先安装 Node.js（fnm / nvm / Homebrew 均可），再点击「安装 dsh」。")
+                      message: "未找到 npm（Node.js 可能未安装）。\n\n请先安装 Node.js（fnm / nvm / Homebrew 均可），再点击「安装 dsh」。")
             return
         }
         installInProgress = true
         isInstallingDsh = true
         refresh()
+
+        // 清空旧安装日志，避免面板显示上一次的内容
+        try? "".write(to: installLogFile, atomically: true, encoding: .utf8)
 
         let panel = InstallPanel()
         installPanel = panel
@@ -854,31 +897,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RunLoop.main.add(t, forMode: .common)
         installLogTimer = t
 
-        // 后台执行安装：`npx --yes` 免确认，装完打印版本号退出（timeout 180s 防卡死）。
-        // 关键：安装同样使用完整终端环境（以 App 当前环境为底，叠加 zsh 抓取的完整环境），
+        // 后台执行全局安装（timeout 180s 防卡死）。
+        // 关键：使用完整终端环境（以 App 当前环境为底，叠加 zsh 抓取的完整环境），
         // 保证依赖 native 编译（make/clang/python）的包能和服务运行时一样正常安装。
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var env = ProcessInfo.processInfo.environment
             for (k, v) in serviceEnvironment(nodePath: node) {
                 env[k] = v
             }
-            let r = runProcess(node, [npx, "--yes", "@deepseek-ai/dsh", "--version"], timeout: 180, env: env)
-            DispatchQueue.main.async { self?.installFinished(processResult: r) }
+            let code = runProcessLogging(node, [npm, "install", "-g", "@deepseek-ai/dsh"],
+                                         timeout: 180, env: env, logURL: installLogFile)
+            DispatchQueue.main.async { self?.installFinished(code: code) }
         }
     }
 
     @objc func refreshInstallLog() {
-        installPanel?.updateLog(logTail(30))
+        installPanel?.updateLog(installLogTail(30))
     }
 
-    private func installFinished(processResult r: (code: Int32, out: String, err: String)) {
+    private func installFinished(code: Int32) {
         installLogTimer?.invalidate()
         installLogTimer = nil
         installInProgress = false
         isInstallingDsh = false
         refresh()
 
-        if r.code == 0 && dshInstalled() {
+        if code == 0 && dshInstalled() {
             installPanel?.setSuccess()
             // 稍作停留展示“安装完成”，然后自动关闭面板并拉起服务
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -887,8 +931,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.launchService()
             }
         } else {
-            let detail = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
-            installPanel?.setFailure(detail.isEmpty ? "安装失败（退出码 \(r.code)），请检查网络后重试。" : detail)
+            let tail = installLogTail(20)
+            installPanel?.setFailure("安装失败（退出码 \(code)），请检查网络后重试。\n\n\(tail)")
         }
     }
 
