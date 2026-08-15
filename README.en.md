@@ -59,31 +59,6 @@ To switch:
 2. Quit and reopen DSH Launcher (or click **Restart service**) — the service starts automatically
 3. Once the status turns green, click **Open Web UI** — past sessions are fully resumable
 
-## LAN access (optional, community plugin)
-
-This app only hosts the local service (dsh upstream intentionally refuses binding `0.0.0.0` for safety, and
-non-secure-context browsers break some features). For LAN access use the community plugin
-[moxisuki/dsh-lan](https://github.com/moxisuki/dsh-lan) (verified against rc.6 — page, API, and
-add-workspace all work). **No startup command change needed**:
-
-```bash
-# 1. Install the plugin once
-dsh plugin --profile web add "/Users/$USER/.dsh/plugins/dsh-lan"
-
-# 2. Copy dsh-lan's overlay into the profile patch layer once (auto-applied on every dsh web start)
-cp "/Users/$USER/.dsh/plugins/dsh-lan/cordis.yml" \
-   "/Users/$USER/.dsh/profiles/web/cordis.patch.yml"
-
-# 3. Restart the service (click "Restart service" in the app menu); the command stays `dsh web --port 3080`
-```
-
-Open the `(LAN: http://<your-IP>:3080)` address printed at startup.
-To turn LAN access off, restore `~/.dsh/profiles/web/cordis.patch.yml` to `[]` and restart the service.
-Known limitation (upstream pins these to loopback clients): settings, credentials, and agent-preset
-editing return 403 over LAN; the UI degrades gracefully.
-⚠️ dsh web has no authentication layer — LAN access exposes remote code execution to your whole LAN;
-use only on trusted networks.
-
 ## Technical notes
 
 - **Environment inheritance**: launchd has no shell configuration of its own, so before every start
