@@ -4,7 +4,8 @@
 
 A macOS menu bar app that hands the `dsh web` service over to launchd — **no terminal required**.
 **App on → service on: launching the app starts the service, quitting stops it.**
-Click the whale icon in the menu bar (🐋 green = running / orange = port occupied externally / red = failed to start / gray = not running; the official dsh whale logo tinted by state) to control it.
+Click the whale icon in the menu bar (🐋 green = running / orange = port occupied externally / red = failed to start / gray = not running; the official dsh whale logo tinted by state) to open the control menu: Open Web UI, Restart service, Launch at login, Open data directory, or Quit.
+> Green requires **both** the launchd process running **and** HTTP 3080 actually reachable — neither alone turns it green.
 The service process inherits your terminal's zsh environment (PATH etc.), so the agent's shell tools get node/npm/pnpm/bun directly.
 
 ![DSH Launcher menu bar](docs/screenshot.png)
@@ -14,8 +15,10 @@ The service process inherits your terminal's zsh environment (PATH etc.), so the
 **No.** The only prerequisite is Node.js on the machine:
 
 - This app starts and manages `dsh web --port 3080` itself (auto-started on launch, or via "Restart service");
-  an existing dsh (global install or npx cache) is reused, and if none exists the first start
-  automatically downloads it — no manual commands needed.
+  an existing dsh (global install or npx cache) is reused.
+- On first use (no local dsh) the app does not auto-download: the menu bar shows
+  "dsh not installed" with an **Install dsh** button. Clicking it opens an install panel
+  with live download logs; once installed, the service starts automatically — no app restart needed.
 - If you ran `dsh web` in a terminal before, that process holds port 3080 and the app shows
   orange "external instance" — press `Ctrl+C` there to stop it, then let the app take over (steps below).
 
@@ -45,6 +48,7 @@ The output `dist/DSH Launcher.app` is directly runnable — copy it anywhere (e.
 |---|---|
 | Status line | Whether the service is running (launchd-managed / external instance on port 3080) |
 | Open Web UI (⌘O) | Opens http://127.0.0.1:3080 in the browser |
+| Install dsh (shown only when not installed) | Installs dsh on first use with a live progress panel; starts the service automatically when done |
 | Restart service | Always available: running = restart; failed/stopped = start; port taken by an external instance = dialog explaining who owns it |
 | Launch at login | Shows the menu bar icon and starts the service after login |
 | Open data directory | `~/.dsh` |
