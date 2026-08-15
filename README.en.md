@@ -1,6 +1,6 @@
 # DSH Launcher — Menu Bar App for DeepSeek Harness
 
-[中文](README.md) | **English** | [Windows version (system tray app)](dsh-win-app/)
+[中文](README.md) | **English**
 
 A macOS menu bar app that hands the `dsh web` service over to launchd — **no terminal required**.
 **App on → service on: launching the app starts the service, quitting stops it.**

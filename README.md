@@ -1,6 +1,6 @@
 # DSH Launcher — DeepSeek Harness 菜单栏 App
 
-[English](README.en.md) | **中文** | [Windows 版（系统托盘 App）](dsh-win-app/)
+[English](README.en.md) | **中文**
 
 macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再需要开着终端**。
 **App 在 → 服务就在：启动 App 自动拉起服务，退出 App 自动停止服务。**
