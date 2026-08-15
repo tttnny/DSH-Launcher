@@ -5,25 +5,16 @@
 macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再需要开着终端**。
 **App 在 → 服务就在：启动 App 自动拉起服务，退出 App 自动停止服务。**
 点击菜单栏鲸鱼图标（🐋 绿=运行中 / 橙=端口被外部占用 / 红=启动失败 / 灰=未运行，图标为官方 dsh 鲸鱼 logo 按状态着色）即可控制。
-启动后 3.5 秒健康检查，进程退出则弹日志尾部。
+服务进程继承你终端的 zsh 环境（PATH 等），agent 的 shell 工具直接可用 node/npm/pnpm/bun 等工具链。
 
 ![DSH Launcher 菜单栏效果](docs/screenshot.png)
 
 ## 需要先手动执行 `npx @deepseek-ai/dsh web` 吗？
 
-**不需要。** 使用本 App 的前提只是"机器上装有 Node.js"，不要求你事先手动跑过
-`npx @deepseek-ai/dsh web`：
+**不需要。** 前提只是"机器上装有 Node.js"：
 
-- Web UI 本身是跑在本机上的服务（http://127.0.0.1:3080），必须有一个
-  `dsh web` 进程在运行才能打开——而这个进程正是**本 App 负责启动和托管**的：
-  点"重启服务"（或 App 启动时自动拉起）会通过 launchd 执行
-  `dsh web --port 3080`。
-- 本机已有 dsh（全局安装或 npx 缓存）时直接复用；完全没有时，首次启动会
-  自动执行 `npx --yes @deepseek-ai/dsh` 联网下载（之后走本地缓存），
-  开箱即用，无需任何手动命令。
-- 反过来要注意：如果你**之前**在终端手动跑过 `npx @deepseek-ai/dsh web`，
-  那个进程会占着 3080 端口，App 会显示橙色"外部实例"；先在终端按
-  `Ctrl+C` 停掉旧进程，再让 App 接管（见下文"从终端实例切换"）。
+- 本 App 负责启动并托管 `dsh web --port 3080`（App 启动自动拉起，也可点"重启服务"手动拉起）；已有 dsh（全局安装或 npx 缓存）直接复用，完全没有时首次启动自动联网下载，开箱即用。
+- 如果你之前在终端手动跑过 `dsh web`，那个进程占着 3080 端口，App 会显示橙色"外部实例"——先在终端按 `Ctrl+C` 停掉，再让 App 接管（步骤见下文）。
 
 ## 安装（DMG 发行版）
 
@@ -43,8 +34,7 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 ./build.sh        # 产出 dist/DSH Launcher.app（ad-hoc 签名，无需开发者账号）
 ```
 
-构建产物已安装到 `~/Applications/DSH Launcher.app`。改代码后重新 `./build.sh`，
-再 `cp -R dist/DSH\ Launcher.app ~/Applications/` 覆盖即可。
+产物为可直接运行的 `dist/DSH Launcher.app`，拷贝到任意位置（如 `~/Applications/`）即可使用。
 
 ## 菜单功能
 
@@ -74,7 +64,7 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 页面、API、添加工作区均正常），安装后**无需改启动命令**：
 
 ```bash
-# 1. 一次性安装插件（本机已装好，链接到 ~/.dsh/plugins/dsh-lan）
+# 1. 一次性安装插件
 dsh plugin --profile web add "/Users/$USER/.dsh/plugins/dsh-lan"
 
 # 2. 一次性把 dsh-lan 的 overlay 写进 profile 补丁层（每次 dsh web 启动自动应用）
@@ -91,15 +81,13 @@ cp "/Users/$USER/.dsh/plugins/dsh-lan/cordis.yml" \
 
 ## 技术要点
 
-- **服务定义**：`~/Library/LaunchAgents/com.dsh.web.plist`（600 权限），
-  直接运行 `<fnm node> <npx缓存 dsh bin.js> web --port 3080`，不依赖 PATH——
-  因为 launchd 登录环境里没有 node（你的 node 是 fnm 的临时 shim）。
-- **自启定义**：`~/Library/LaunchAgents/com.dsh.menubar.plist`（仅 App 自启；服务不做登录自启，`RunAtLoad` 恒为 false，由用户手动启动）。
-- **API key**：harness 直接从 `~/.dsh/.credentials.yaml` 读取，launchd 环境无需额外配置。
-- 每次"启动服务"会重新解析 node 路径与最新的 dsh 包路径并重写 plist，
-  升级 dsh（npx 缓存换目录）后无需手动改配置。
-- 服务停止 = `launchctl bootout`，launchd 会终止整个进程树并落盘会话。
-- 日志：`~/Library/Logs/DSHLauncher/dsh-web.log`。
+- **环境继承**：launchd 本身没有你的 shell 配置，所以每次启动服务前，App 会用
+  `zsh -lic` 抓取你的完整环境写入 plist 的 `EnvironmentVariables`（PATH 剔除易失的
+  fnm multishell 临时目录、node 目录置顶）。服务进程与 agent 的 shell 工具因此
+  直接可用终端同款工具链（node/npm/pnpm/bun 等），改 `.zshrc` 后重启服务即生效。
+- **升级 dsh 无需改配置**：每次启动服务都会重新解析 node 与最新 dsh 包路径并
+  重写 `~/Library/LaunchAgents/com.dsh.web.plist`。
+- **日志**：`~/Library/Logs/DSHLauncher/dsh-web.log`。
 
 ## 卸载
 
