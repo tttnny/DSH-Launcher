@@ -298,17 +298,50 @@ func portServing() -> Bool {
     return !code.isEmpty && code != "000"
 }
 
-/// 找出占用 3080 端口的进程描述（lsof + ps），用于启动前提示
-func port3080Occupier() -> String {
+/// 找出占用 3080 端口的进程（lsof + ps），返回 PID 与完整命令行；无占用返回 nil。
+func port3080Process() -> (pid: Int32, cmd: String)? {
     let r = runProcess("/usr/sbin/lsof", ["-nP", "-iTCP:3080", "-sTCP:LISTEN"])
     var lines = r.out.components(separatedBy: .newlines)
     if let first = lines.first, first.hasPrefix("COMMAND") { lines.removeFirst() }
-    guard let first = lines.first else { return "未知进程" }
+    guard let first = lines.first else { return nil }
     let fields = first.split(separator: " ").filter { !$0.isEmpty }.map(String.init)
-    guard fields.count >= 2, let pid = Int32(fields[1]) else { return "未知进程" }
+    guard fields.count >= 2, let pid = Int32(fields[1]) else { return nil }
     let p = runProcess("/bin/ps", ["-p", "\(pid)", "-o", "command="])
     let cmd = p.out.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (pid, cmd)
+}
+
+/// 找出占用 3080 端口的进程描述，用于启动前提示
+func port3080Occupier() -> String {
+    guard let (pid, cmd) = port3080Process() else { return "未知进程" }
     return "PID \(pid)（\(cmd.isEmpty ? "未知命令" : cmd)）"
+}
+
+/// 判断占用 3080 端口的进程是否是 dsh（外部实例，如终端里手动跑的 dsh web）。
+/// 通过命令行关键字识别：dsh 进程形如 `node .../lib/bin.js web --port 3080`
+/// 或 `dsh web --port 3080`，命令行必含 "dsh" 或 "deepseek-ai"。
+func port3080IsDsh() -> Bool {
+    guard let (_, cmd) = port3080Process() else { return false }
+    return cmd.localizedCaseInsensitiveContains("dsh") ||
+           cmd.localizedCaseInsensitiveContains("deepseek-ai")
+}
+
+/// 结束占用 3080 端口的进程（先 SIGTERM 优雅退出，2 秒后仍未释放则 SIGKILL）。
+/// 返回端口是否已释放（无占用时视为成功）。
+@discardableResult
+func killPort3080() -> Bool {
+    guard let (pid, _) = port3080Process() else { return true }
+    runProcess("/bin/kill", ["\(pid)"]) // SIGTERM 优雅退出
+    for _ in 0..<20 {                    // 最多等 2 秒
+        if port3080Process() == nil { return true }
+        usleep(100_000)
+    }
+    runProcess("/bin/kill", ["-9", "\(pid)"]) // SIGKILL 兜底
+    for _ in 0..<10 {                    // 再等 1 秒
+        if port3080Process() == nil { return true }
+        usleep(100_000)
+    }
+    return port3080Process() == nil
 }
 
 /// 服务日志尾部，用于启动失败时弹窗展示
@@ -326,7 +359,7 @@ func installLogTail(_ n: Int = 30) -> String {
     return trimmed.isEmpty ? "(等待输出…)" : text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
 }
 
-enum ServiceState: Hashable { case running, starting, installing, notInstalled, external, crashed, stopped }
+enum ServiceState: Hashable { case running, starting, installing, notInstalled, portBusy, crashed, stopped }
 
 /// 服务正在启动（App 自动拉起 / 手动重启的窗口期），期间状态显示“正在启动”
 var isStarting = false
@@ -339,18 +372,18 @@ func dshInstalled() -> Bool {
     resolveDshLauncher(nodePath: resolveNodePath()) != nil
 }
 
-/// 服务状态判定。绿色（.running）必须同时满足：launchd 任务在运行 **且**
-/// HTTP 3080 实际可访问。仅凭 launchd 状态显示绿色，会在「未安装 dsh、
-/// npx 还在联网下载/已失败、或 launchd 残留旧任务」时产生误报。
+/// 服务状态判定。核心原则：只看 3080 端口上跑的是不是 dsh，不关心谁在托管。
+/// - 端口上是 dsh → 绿色（无论 App 托管 / 终端手动 / 孤儿进程，本质同一个服务）
+/// - 端口被非 dsh 程序占用 → 橙色（dsh 真的不可用）
 func serviceState() -> ServiceState {
     // 手动安装进行中（installDsh 设置了 isInstallingDsh），优先显示“安装中”
     if isStarting || isInstallingDsh { return isInstallingDsh ? .installing : .starting }
     if !dshInstalled() { return .notInstalled }
-    if serviceRunning() && portServing() { return .running }
-    // 进程还活着但 HTTP 不通：启动窗口期显示"正在启动"；
-    // 窗口结束（isStarting=false）后仍不通，视为异常（红色）。
+    if port3080IsDsh() { return .running }
+    // 端口被非 dsh 程序占用：dsh 不可用
+    if portServing() { return .portBusy }
+    // launchd 任务在跑但端口上无 dsh：启动失败或进程崩溃（窗口期外）
     if serviceRunning() { return .crashed }
-    if portServing() { return .external }
     if serviceLoaded() {
         // 只有“任务已加载、进程没在跑、且上次退出码非 0”才算真失败；
         // 刚启动的过渡期（bootstrap 后进程尚未就绪）会显示 last exit code =
@@ -697,7 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch state {
             case .running: return .systemGreen
             case .starting, .installing, .notInstalled: return .systemGray
-            case .external: return .systemOrange
+            case .portBusy: return .systemOrange
             case .crashed: return .systemRed
             case .stopped: return .systemGray
             }
@@ -720,7 +753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch state {
                 case .running: return ("●", .systemGreen)
                 case .starting, .installing, .notInstalled: return ("◌", .systemGray)
-                case .external: return ("◍", .systemOrange)
+                case .portBusy: return ("◍", .systemOrange)
                 case .crashed: return ("✕", .systemRed)
                 case .stopped: return ("○", .systemGray)
                 }
@@ -797,9 +830,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(webURL)
     }
 
-    /// 统一的启动/重启流程：先停掉旧实例（幂等），再拉起并做轮询健康检查。
-    /// 运行中 → 停止后重新拉起；启动失败/未运行 → 直接启动；
-    /// 端口被外部实例占用 → 弹窗说明占用者（不破坏外部实例）。
+    /// 统一的启动/重启流程：先处理端口占用（dsh 实例直接结束接管、其他程序确认后结束），
+    /// 再停掉旧实例（幂等）、拉起并做轮询健康检查。
+    /// 运行中 → 停止后重新拉起；启动失败/未运行 → 直接启动。
     func launchService() {
         if !dshInstalled() {
             showAlert(title: "dsh 未安装",
@@ -808,12 +841,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if !serviceRunning() && portServing() {
-            showAlert(title: "端口 3080 已被占用",
-                      message: "占用者：\(port3080Occupier())\n\n请先停止占用端口的进程（如果是终端里跑的 dsh web，在终端按 Ctrl+C），再点“重启服务”。")
-            refresh()
+            if port3080IsDsh() {
+                // 外部/孤儿 dsh 实例：直接结束并接管（无需用户手动 Ctrl+C）
+                if killPort3080() {
+                    performRestart()
+                } else {
+                    showAlert(title: "无法结束占用进程",
+                              message: "占用者：\(port3080Occupier())\n\n无法自动结束该进程，请手动处理后再点“重启服务”。")
+                    refresh()
+                }
+            } else {
+                // 非 dsh 程序占用：确认后再结束，避免误杀其他工作
+                let alert = NSAlert()
+                alert.messageText = "端口 3080 被其他程序占用"
+                alert.informativeText = "占用者：\(port3080Occupier())\n\n是否结束该进程并重启 dsh 服务？"
+                alert.addButton(withTitle: "结束并重启")
+                alert.addButton(withTitle: "取消")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    if killPort3080() {
+                        performRestart()
+                    } else {
+                        showAlert(title: "无法结束占用进程",
+                                  message: "占用者：\(port3080Occupier())\n\n无法自动结束该进程，请手动处理后再试。")
+                    }
+                }
+                refresh()
+            }
             return
         }
-        stopService() // 幂等：任务未加载时无副作用
+        performRestart()
+    }
+
+    /// 实际执行重启：停旧实例 + 兜底杀端口（幂等），再拉起并轮询健康检查。
+    func performRestart() {
+        stopService()     // 幂等：停 launchd 任务（App 托管时）
+        killPort3080()    // 兜底：无论谁占 3080，重启前都释放端口
         isStarting = true
         // 无本地 dsh 缓存说明是首次使用，需要 npx 联网下载 → 显示“dsh 安装中”
         isInstallingDsh = resolveDshLauncher(nodePath: resolveNodePath()) == nil
@@ -961,13 +1023,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    /// 退出前自动停止服务（launchctl bootout；只停本 App 托管的 launchd 任务，
-    /// 不影响其他进程占用的端口）。被单实例守卫淘汰的重复实例不执行此逻辑。
+    /// 退出前停止服务：先 bootout 停掉 App 托管的 launchd 任务，
+    /// 再杀掉 3080 端口上的进程（覆盖外部实例/孤儿进程，保证退出后端口必释放）。
+    /// 被单实例守卫淘汰的重复实例不执行此逻辑。
     func applicationWillTerminate(_ notification: Notification) {
         if !isDuplicateExit {
             stopService()
             // bootout 是异步卸载：等待任务完全消失再退出，避免服务进程残留（最多等 1 秒）
             for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
+            // 兜底：无论谁在跑 3080，退出都杀掉，确保「退出 App → 服务停止」
+            killPort3080()
         }
     }
 
@@ -980,7 +1045,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .starting: statusLine.title = "服务：正在启动…"
         case .installing: statusLine.title = "服务：dsh 安装中…"
         case .notInstalled: statusLine.title = "服务：dsh 未安装"
-        case .external: statusLine.title = "服务：外部实例运行中（端口 3080 被占用）"
+        case .portBusy: statusLine.title = "服务：端口 3080 被其他程序占用"
         case .crashed: statusLine.title = "服务：启动失败（点“重启服务”重试）"
         case .stopped: statusLine.title = "服务：未运行\(envNote)"
         }
