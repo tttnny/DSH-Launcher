@@ -6,3 +6,6 @@ build/
 dist/DSH Launcher.app/
 dist/*.zip
 dist/*.dmg
+
+# 本机专用说明（不提交）
+AGENTS.md

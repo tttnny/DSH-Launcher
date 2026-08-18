@@ -46,6 +46,8 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 | 打开 Web UI (⌘O) | 浏览器打开 http://127.0.0.1:3080 |
 | 安装 dsh（仅未安装时显示） | 首次使用点击安装，弹窗实时显示下载进度，装完自动启动服务 |
 | 重启服务 | 永远可用：运行中=重启；启动失败/未运行=直接启动；端口被外部实例占用=弹窗说明占用者 |
+| 更新 dsh / 检查更新 | 自动检测 npm 新版本（启动 10 秒后及每 6 小时各查一次，静默不弹窗）：发现新版本时菜单变为「更新 dsh → vX」，点击一键升级（`npm install -g @deepseek-ai/dsh@latest`），完成后自动重启服务；无更新时点此手动检查 |
+| dsh 版本：vX | 只读信息行，显示当前已安装的 dsh 版本（未安装时显示「未安装」） |
 | 登录时自动启动本 App | 登录后自动出现菜单栏图标并拉起服务 |
 | 打开数据目录 | `~/.dsh` |
 | 退出 | 退出 App **并停止服务**（`launchctl bootout`，数据已落盘，下次打开 App 即恢复） |
@@ -67,6 +69,10 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
   直接可用终端同款工具链（node/npm/pnpm/bun 等），改 `.zshrc` 后重启服务即生效。
 - **升级 dsh 无需改配置**：每次启动服务都会重新解析 node 与最新 dsh 包路径并
   重写 `~/Library/LaunchAgents/com.dsh.web.plist`。
+- **自动更新检测**：App 启动 10 秒后及每 6 小时查询一次 npm registry
+  （`@deepseek-ai/dsh` 的 latest 版本），与本地已装版本对比；发现新版本时菜单栏出现
+  「更新 dsh → vX」并弹窗提示，一键执行 `npm install -g @deepseek-ai/dsh@latest`，
+  完成后自动重启服务加载新版。更新日志：`~/Library/Logs/DSHLauncher/dsh-update.log`。
 - **日志**：`~/Library/Logs/DSHLauncher/dsh-web.log`。
 
 ## 卸载

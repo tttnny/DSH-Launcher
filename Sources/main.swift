@@ -196,12 +196,14 @@ let launchAgentsDir = homeDir.appendingPathComponent("Library/LaunchAgents", isD
 let logDir = homeDir.appendingPathComponent("Library/Logs/DSHLauncher", isDirectory: true)
 let logFile = logDir.appendingPathComponent("dsh-web.log")
 let installLogFile = logDir.appendingPathComponent("dsh-install.log")
+let updateLogFile = logDir.appendingPathComponent("dsh-update.log")
 let serviceLabel = "com.dsh.web"
 let appLabel = "com.dsh.menubar"
 let servicePlistURL = launchAgentsDir.appendingPathComponent("\(serviceLabel).plist")
 let appPlistURL = launchAgentsDir.appendingPathComponent("\(appLabel).plist")
 let guiDomain = "gui/\(getuid())"
 let webURL = URL(string: "http://127.0.0.1:3080")!
+let npmLatestURL = URL(string: "https://registry.npmjs.org/@deepseek-ai/dsh/latest")!
 let defaults = UserDefaults.standard
 
 /// 单实例守卫淘汰的重复实例：退出时不应触发“停止服务”
@@ -344,19 +346,27 @@ func killPort3080() -> Bool {
     return port3080Process() == nil
 }
 
+/// 日志文件尾部（通用），用于弹窗展示 / 面板实时进度
+func tail(of url: URL, n: Int = 25, placeholder: String = "(日志为空)") -> String {
+    guard let data = fs.contents(atPath: url.path),
+          let text = String(data: data, encoding: .utf8) else { return placeholder }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? placeholder : text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
+}
+
 /// 服务日志尾部，用于启动失败时弹窗展示
 func logTail(_ n: Int = 25) -> String {
-    guard let data = fs.contents(atPath: logFile.path),
-          let text = String(data: data, encoding: .utf8) else { return "(日志为空)" }
-    return text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
+    tail(of: logFile, n: n, placeholder: "(日志为空)")
 }
 
 /// 安装日志尾部，用于安装面板实时展示下载/安装进度
 func installLogTail(_ n: Int = 30) -> String {
-    guard let data = fs.contents(atPath: installLogFile.path),
-          let text = String(data: data, encoding: .utf8) else { return "(等待输出…)" }
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? "(等待输出…)" : text.components(separatedBy: .newlines).suffix(n).joined(separator: "\n")
+    tail(of: installLogFile, n: n, placeholder: "(等待输出…)")
+}
+
+/// 更新日志尾部，用于更新面板实时展示进度
+func updateLogTail(_ n: Int = 30) -> String {
+    tail(of: updateLogFile, n: n, placeholder: "(等待输出…)")
 }
 
 enum ServiceState: Hashable { case running, starting, installing, notInstalled, portBusy, crashed, stopped }
@@ -370,6 +380,75 @@ var isInstallingDsh = false
 /// 安装完成后此函数返回 true，UI 自动从“未安装”进入正常流程。
 func dshInstalled() -> Bool {
     resolveDshLauncher(nodePath: resolveNodePath()) != nil
+}
+
+/// 读取 package.json 的 version 字段
+func versionFromPackage(_ pkgPath: String) -> String? {
+    guard let data = fs.contents(atPath: pkgPath),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let v = obj["version"] as? String, !v.isEmpty else { return nil }
+    return v
+}
+
+/// 本地已安装的 dsh 版本号（全局 npm 安装或 npx 缓存任一命中）。
+/// 全局安装：<node 安装前缀>/lib/node_modules/@deepseek-ai/dsh/package.json
+/// （fnm: ~/.local/share/fnm/node-versions/<v>/installation/lib/node_modules/...
+///  nvm: ~/.nvm/versions/node/<v>/lib/node_modules/...）
+/// npx 缓存：~/.npm/_npx/<hash>/node_modules/@deepseek-ai/dsh/package.json（取最新 mtime）。
+func localDshVersion() -> String? {
+    let node = resolveNodePath()
+    let nodeDir = (node as NSString).deletingLastPathComponent
+    var candidates: [String] = []
+    if nodeDir != "/usr/bin" {
+        let prefix = (nodeDir as NSString).deletingLastPathComponent
+        candidates.append("\(prefix)/lib/node_modules/@deepseek-ai/dsh/package.json")
+    }
+    let npxRoot = homeDir.appendingPathComponent(".npm/_npx").path
+    if let entries = try? fs.contentsOfDirectory(atPath: npxRoot) {
+        var best: (path: String, mtime: Date)? = nil
+        for e in entries {
+            let pkg = "\(npxRoot)/\(e)/node_modules/@deepseek-ai/dsh/package.json"
+            guard fs.fileExists(atPath: pkg),
+                  let attrs = try? fs.attributesOfItem(atPath: pkg) else { continue }
+            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
+            if best == nil || mtime > best!.mtime { best = (pkg, mtime) }
+        }
+        if let b = best { candidates.append(b.path) }
+    }
+    for c in candidates where fs.fileExists(atPath: c) {
+        if let v = versionFromPackage(c) { return v }
+    }
+    return nil
+}
+
+/// 简易 semver 比较：忽略 prerelease/build 后缀，逐段比较主/次/修订号。
+func isNewerVersion(_ a: String, than b: String) -> Bool {
+    func core(_ v: String) -> [Int] {
+        let head = v.split(whereSeparator: { $0 == "-" || $0 == "+" }).first.map(String.init) ?? ""
+        return head.split(separator: ".").compactMap { Int($0) }
+    }
+    let x = core(a), y = core(b)
+    for i in 0..<max(x.count, y.count) {
+        let xi = i < x.count ? x[i] : 0
+        let yi = i < y.count ? y[i] : 0
+        if xi != yi { return xi > yi }
+    }
+    return false
+}
+
+/// 查询 npm registry 上 @deepseek-ai/dsh 的 latest 版本号；失败（网络/解析）返回 nil。
+func fetchLatestDshVersion(completion: @escaping (String?) -> Void) {
+    var req = URLRequest(url: npmLatestURL)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { data, _, error in
+        guard error == nil, let data = data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let v = obj["version"] as? String, !v.isEmpty else {
+            completion(nil)
+            return
+        }
+        completion(v)
+    }.resume()
 }
 
 /// 服务状态判定。核心原则：只看 3080 端口上跑的是不是 dsh，不关心谁在托管。
@@ -597,15 +676,27 @@ final class InstallPanel: NSPanel {
     private let statusLabel = NSTextField(labelWithString: "首次安装需联网下载，请稍候…")
     private let logView = NSTextView()
     private let bgButton = NSButton(title: "后台运行", target: nil, action: nil)
+    private let doneTitle: String
+    private let doneStatus: String
+    private let failTitle: String
 
-    init() {
+    /// 进度面板，文案可定制（安装 / 更新共用）。
+    init(panelTitle: String = "安装 dsh",
+         statusTitle: String = "正在安装 dsh…",
+         statusText: String = "首次安装需联网下载，请稍候…",
+         doneTitle: String = "dsh 安装完成",
+         doneStatus: String = "即将自动启动服务…",
+         failTitle: String = "dsh 安装失败") {
+        self.doneTitle = doneTitle
+        self.doneStatus = doneStatus
+        self.failTitle = failTitle
         super.init(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
                    styleMask: [.titled, .closable],
                    backing: .buffered, defer: false)
-        title = "安装 dsh"
+        self.title = panelTitle
         isFloatingPanel = true
         // 关键：isFloatingPanel 默认会让面板在 App 失活时自动隐藏（切到其他 App 就消失）。
-        // 这里显式关闭该行为，让安装面板始终停留，直到用户手动关闭或安装完成。
+        // 这里显式关闭该行为，让进度面板始终停留，直到用户手动关闭或流程完成。
         hidesOnDeactivate = false
         isReleasedWhenClosed = false // 关闭后不自动释放（生命周期由 App 手动管理）
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary] // 跨空间/全屏时仍可见
@@ -616,9 +707,11 @@ final class InstallPanel: NSPanel {
         spinner.startAnimation(nil)
         spinner.frame = NSRect(x: 20, y: 278, width: 24, height: 24)
 
+        titleLabel.stringValue = statusTitle
         titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
         titleLabel.frame = NSRect(x: 56, y: 281, width: 360, height: 18)
 
+        statusLabel.stringValue = statusText
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.frame = NSRect(x: 56, y: 261, width: 400, height: 16)
@@ -646,29 +739,29 @@ final class InstallPanel: NSPanel {
         contentView = content
     }
 
-    /// 刷新日志（调用方传服务日志尾部）。
+    /// 刷新日志（调用方传日志尾部）。
     func updateLog(_ text: String) {
         guard !logView.string.isEmpty || !text.isEmpty else { return }
         logView.string = text
         logView.scrollToEndOfDocument(nil)
     }
 
-    /// 安装成功：停 spinner，1 秒后由外部关闭面板。
+    /// 成功：停 spinner，1 秒后由外部关闭面板。
     func setSuccess() {
         spinner.stopAnimation(nil)
-        titleLabel.stringValue = "dsh 安装完成"
-        statusLabel.stringValue = "即将自动启动服务…"
+        titleLabel.stringValue = doneTitle
+        statusLabel.stringValue = doneStatus
     }
 
-    /// 安装失败：展示错误信息，面板保留供查看日志，可关闭后重试。
+    /// 失败：展示错误信息，面板保留供查看日志，可关闭后重试。
     func setFailure(_ reason: String) {
         spinner.stopAnimation(nil)
-        titleLabel.stringValue = "dsh 安装失败"
+        titleLabel.stringValue = failTitle
         statusLabel.stringValue = reason
     }
 
     @objc private func backgroundTapped() {
-        close() // 面板关闭，安装继续在后台执行，完成后自动拉起服务
+        close() // 面板关闭，流程继续在后台执行，完成后自动处理
     }
 }
 
@@ -682,7 +775,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var openItem: NSMenuItem!
     private var restartItem: NSMenuItem!
     private var installItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
+    private var versionItem: NSMenuItem!
     private var autoAppItem: NSMenuItem!
+
+    /// dsh 更新检测/升级流程状态
+    private var latestRemoteVersion: String?      // npm 最新版本
+    private var updateAvailable = false           // 是否存在可升级的新版本
+    private var checkingUpdates = false           // 正在查询 npm registry
+    private var updatingInProgress = false        // 正在执行 npm 升级
+    private var updatePanel: InstallPanel?
+    private var updateLogTimer: Timer?
 
     /// dsh 安装流程状态
     private var installInProgress = false
@@ -719,6 +822,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let t = Timer(timeInterval: 5, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        // 自动检查 dsh 更新：启动 10 秒后查一次，之后每 6 小时自动查一次（静默，不打扰）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.checkForUpdates(notifyIfUpToDate: false)
+        }
+        let updateTimer = Timer(timeInterval: 6 * 3600, target: self,
+                                selector: #selector(autoCheckUpdates), userInfo: nil, repeats: true)
+        RunLoop.main.add(updateTimer, forMode: .common)
     }
 
     private var whaleIconCache: [ServiceState: NSImage] = [:]
@@ -772,6 +882,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.isEnabled = false
         menu.addItem(header)
 
+        // 当前 dsh 版本（只读信息行，紧跟在标题下方）
+        versionItem = NSMenuItem(title: "dsh 版本：-", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
         statusLine.isEnabled = false
         menu.addItem(statusLine)
 
@@ -788,6 +903,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         restartItem = NSMenuItem(title: "重启服务", action: #selector(doRestart), keyEquivalent: "")
         restartItem.target = self
         menu.addItem(restartItem)
+
+        updateItem = NSMenuItem(title: "检查更新", action: #selector(checkUpdateTapped), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
 
         menu.addItem(.separator())
 
@@ -998,6 +1117,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: dsh 更新（自动检测 + 一键升级）
+
+    /// 菜单「更新 dsh / 检查更新」：已有可用更新则直接执行升级，否则手动检查一次。
+    @objc func checkUpdateTapped() {
+        if updateAvailable {
+            performUpdate()
+        } else {
+            checkForUpdates(notifyIfUpToDate: true)
+        }
+    }
+
+    /// 每 6 小时定时自动检查（静默，不打扰）。
+    @objc func autoCheckUpdates() {
+        checkForUpdates(notifyIfUpToDate: false)
+    }
+
+    /// 查询 npm registry 最新版并与本地版本对比；发现新版本时仅更新菜单（不弹窗打扰），
+    /// 手动检查（notifyIfUpToDate）时反馈结果。
+    func checkForUpdates(notifyIfUpToDate: Bool) {
+        guard !updatingInProgress else { return }
+        guard let local = localDshVersion() else {
+            // 未安装 dsh 时无需检查更新（菜单项此时也隐藏）
+            latestRemoteVersion = nil
+            updateAvailable = false
+            refresh()
+            return
+        }
+        guard !checkingUpdates else { return }
+        checkingUpdates = true
+        refresh()
+        fetchLatestDshVersion { [weak self] remote in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.checkingUpdates = false
+                if let remote = remote, isNewerVersion(remote, than: local) {
+                    // 发现新版本：菜单按钮变「更新 dsh → vX」作为提示，不打扰用户
+                    self.latestRemoteVersion = remote
+                    self.updateAvailable = true
+                } else {
+                    self.latestRemoteVersion = nil
+                    self.updateAvailable = false
+                    if notifyIfUpToDate {
+                        if let remote = remote {
+                            self.showAlert(title: "已是最新版本",
+                                           message: "当前已安装 dsh \(local)，npm 最新版本也是 \(remote)。")
+                        } else {
+                            self.showAlert(title: "检查更新失败",
+                                           message: "无法连接 npm registry，请检查网络后重试。")
+                        }
+                    }
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    /// 一键升级：`npm install -g @deepseek-ai/dsh@latest`（与「安装 dsh」相同的官方
+    /// 全局安装方式），进度面板实时展示日志，完成后自动重启服务加载新版。
+    func performUpdate() {
+        guard !updatingInProgress else { return }
+        let node = resolveNodePath()
+        guard let npm = resolveNpmPath(nodePath: node) else {
+            showAlert(title: "无法更新 dsh",
+                      message: "未找到 npm（Node.js 可能未安装）。")
+            return
+        }
+        updatingInProgress = true
+        refresh()
+
+        // 清空旧更新日志，避免面板显示上一次的内容
+        try? "".write(to: updateLogFile, atomically: true, encoding: .utf8)
+
+        let panel = InstallPanel(panelTitle: "更新 dsh",
+                                 statusTitle: "正在更新 dsh…",
+                                 statusText: "正在从 npm 下载并安装最新版本…",
+                                 doneTitle: "dsh 更新完成",
+                                 doneStatus: "即将自动重启服务…",
+                                 failTitle: "dsh 更新失败")
+        updatePanel = panel
+        panel.center()
+        panel.orderFrontRegardless()
+        panel.makeKey()
+
+        let t = Timer(timeInterval: 1, target: self, selector: #selector(refreshUpdateLog), userInfo: nil, repeats: true)
+        RunLoop.main.add(t, forMode: .common)
+        updateLogTimer = t
+
+        // 后台执行全局升级（timeout 180s 防卡死），使用完整终端环境
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var env = ProcessInfo.processInfo.environment
+            for (k, v) in serviceEnvironment(nodePath: node) {
+                env[k] = v
+            }
+            let code = runProcessLogging(node, [npm, "install", "-g", "@deepseek-ai/dsh@latest"],
+                                         timeout: 180, env: env, logURL: updateLogFile)
+            DispatchQueue.main.async { self?.updateFinished(code: code) }
+        }
+    }
+
+    @objc func refreshUpdateLog() {
+        updatePanel?.updateLog(updateLogTail(30))
+    }
+
+    private func updateFinished(code: Int32) {
+        updateLogTimer?.invalidate()
+        updateLogTimer = nil
+        updatingInProgress = false
+        refresh()
+
+        if code == 0, localDshVersion() != nil {
+            latestRemoteVersion = nil
+            updateAvailable = false
+            updatePanel?.setSuccess()
+            // 稍作停留展示“更新完成”，然后自动关闭面板并重启服务加载新版
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.updatePanel?.close()
+                self?.updatePanel = nil
+                self?.launchService()
+            }
+        } else {
+            let tail = updateLogTail(20)
+            updatePanel?.setFailure("更新失败（退出码 \(code)），请检查网络后重试。\n\n\(tail)")
+        }
+    }
+
     @objc func toggleAutoApp(_ item: NSMenuItem) {
         let on = item.state == .off
         if on {
@@ -1064,6 +1308,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 服务未安装时重启/打开 UI 不可用
         restartItem.isEnabled = state != .notInstalled
         openItem.isEnabled = state != .notInstalled && state != .installing
+        // 「更新 dsh / 检查更新」：dsh 未安装时隐藏；升级中/检查中禁用并改名
+        if !dshInstalled() {
+            updateItem.isHidden = true
+        } else if updatingInProgress {
+            updateItem.title = "dsh 更新中…"
+            updateItem.isEnabled = false
+            updateItem.isHidden = false
+        } else if checkingUpdates {
+            updateItem.title = "检查更新…"
+            updateItem.isEnabled = false
+            updateItem.isHidden = false
+        } else if updateAvailable, let remote = latestRemoteVersion {
+            updateItem.title = "更新 dsh → \(remote)"
+            updateItem.isEnabled = true
+            updateItem.isHidden = false
+        } else {
+            updateItem.title = "检查更新"
+            updateItem.isEnabled = true
+            updateItem.isHidden = false
+        }
+        // 当前 dsh 版本（未安装时显示“未安装”）
+        if let v = localDshVersion() {
+            versionItem.title = "dsh 版本：v\(v)"
+        } else {
+            versionItem.title = "dsh 版本：未安装"
+        }
         autoAppItem.state = appAutoStartEnabled() ? .on : .off
         updateDot(state)
     }

@@ -50,6 +50,8 @@ The output `dist/DSH Launcher.app` is directly runnable — copy it anywhere (e.
 | Open Web UI (⌘O) | Opens http://127.0.0.1:3080 in the browser |
 | Install dsh (shown only when not installed) | Installs dsh on first use with a live progress panel; starts the service automatically when done |
 | Restart service | Always available: running = restart; failed/stopped = start; port taken by an external instance = dialog explaining who owns it |
+| Update dsh / Check for updates | Auto-checks the npm registry for a newer dsh (10s after launch, then every 6 hours, silently): when available the menu becomes "Update dsh → vX"; one click upgrades (`npm install -g @deepseek-ai/dsh@latest`) and restarts the service. Otherwise click to check manually |
+| dsh version: vX | Read-only info line showing the installed dsh version ("Not installed" when missing) |
 | Launch at login | Shows the menu bar icon and starts the service after login |
 | Open data directory | `~/.dsh` |
 | Quit | Quits the app **and stops the service** (`launchctl bootout`; data is persisted, restored next time the app is opened) |
@@ -72,6 +74,11 @@ To switch:
   (node/npm/pnpm/bun, ...); editing `.zshrc` takes effect after a service restart.
 - **dsh upgrades need no config**: every start re-resolves the node path and the latest dsh package
   path and rewrites `~/Library/LaunchAgents/com.dsh.web.plist`.
+- **Auto update check**: 10s after launch and every 6 hours the app queries the npm registry
+  (`@deepseek-ai/dsh` latest) and compares it with the installed version; when a newer version
+  exists the menu shows "Update dsh → vX" with a notification — one click runs
+  `npm install -g @deepseek-ai/dsh@latest` and restarts the service. Update log:
+  `~/Library/Logs/DSHLauncher/dsh-update.log`.
 - **Logs**: `~/Library/Logs/DSHLauncher/dsh-web.log`.
 
 ## Uninstall
