@@ -321,12 +321,16 @@ func port3080Occupier() -> String {
 }
 
 /// 判断占用 3080 端口的进程是否是 dsh（外部实例，如终端里手动跑的 dsh web）。
-/// 通过命令行关键字识别：dsh 进程形如 `node .../lib/bin.js web --port 3080`
-/// 或 `dsh web --port 3080`，命令行必含 "dsh" 或 "deepseek-ai"。
+/// 通过命令行识别：dsh 进程形如 `node .../@deepseek-ai/dsh/lib/bin.js web --port 3080`
+/// 或 `dsh web --port 3080`。
+/// 识别规则（尽量精确，减少误判）：
+/// - 命令行含 "deepseek-ai"（dsh 包路径特征，最可靠）
+/// - "dsh" 作为独立命令词出现（前后非字母数字），排除 `--dsh-mode` 之类含子串的无关进程
 func port3080IsDsh() -> Bool {
     guard let (_, cmd) = port3080Process() else { return false }
-    return cmd.localizedCaseInsensitiveContains("dsh") ||
-           cmd.localizedCaseInsensitiveContains("deepseek-ai")
+    let lower = cmd.lowercased()
+    if lower.contains("deepseek-ai") { return true }
+    return lower.range(of: "(^|[^a-z0-9])dsh([^a-z0-9]|$)", options: .regularExpression) != nil
 }
 
 /// 结束占用 3080 端口的进程（先 SIGTERM 优雅退出，2 秒后仍未释放则 SIGKILL）。
@@ -398,10 +402,30 @@ var isStarting = false
 /// 启动时本地无 dsh 缓存 → 正在通过 npx 首次联网安装 dsh（区别于普通启动）
 var isInstallingDsh = false
 
+/// dsh 本地安装信息缓存：dshInstalled/localDshVersion 每次调用都要扫 fnm/npx 目录
+/// 并读 package.json，而 refresh() 每 5 秒各调一次——用缓存避免无谓的重复扫盘。
+/// key 是 node 路径：node 没变时安装状态与版本视为不变；安装/更新完成后显式失效。
+private var dshInfoCache: (node: String, installed: Bool, version: String?)?
+
+/// 安装/更新完成后调用：dsh 版本或安装状态已变化，下次读取重新扫描。
+func invalidateDshInfo() {
+    dshInfoCache = nil
+}
+
+func cachedDshInfo() -> (node: String, installed: Bool, version: String?) {
+    let node = resolveNodePath()
+    if let c = dshInfoCache, c.node == node { return c }
+    let installed = resolveDshLauncher(nodePath: node) != nil
+    let version = localDshVersionUncached(node: node)
+    let info = (node, installed, version)
+    dshInfoCache = info
+    return info
+}
+
 /// 本地是否已安装 dsh（全局安装或 npx 缓存任一命中）。
 /// 安装完成后此函数返回 true，UI 自动从“未安装”进入正常流程。
 func dshInstalled() -> Bool {
-    resolveDshLauncher(nodePath: resolveNodePath()) != nil
+    cachedDshInfo().installed
 }
 
 /// 读取 package.json 的 version 字段
@@ -412,13 +436,17 @@ func versionFromPackage(_ pkgPath: String) -> String? {
     return v
 }
 
-/// 本地已安装的 dsh 版本号（全局 npm 安装或 npx 缓存任一命中）。
+/// 本地已安装的 dsh 版本号（全局 npm 安装或 npx 缓存任一命中，带缓存）。
+func localDshVersion() -> String? {
+    cachedDshInfo().version
+}
+
+/// 实际扫描逻辑（无缓存）：全局安装或 npx 缓存任一命中。
 /// 全局安装：<node 安装前缀>/lib/node_modules/@deepseek-ai/dsh/package.json
 /// （fnm: ~/.local/share/fnm/node-versions/<v>/installation/lib/node_modules/...
 ///  nvm: ~/.nvm/versions/node/<v>/lib/node_modules/...）
 /// npx 缓存：~/.npm/_npx/<hash>/node_modules/@deepseek-ai/dsh/package.json（取最新 mtime）。
-func localDshVersion() -> String? {
-    let node = resolveNodePath()
+func localDshVersionUncached(node: String) -> String? {
     let nodeDir = (node as NSString).deletingLastPathComponent
     var candidates: [String] = []
     if nodeDir != "/usr/bin" {
@@ -495,26 +523,32 @@ func isNewerVersion(_ a: String, than b: String) -> Bool {
     return cmpPre(ap, bp) > 0
 }
 
-/// 查询 npm registry 上 @deepseek-ai/dsh 的目标更新版本号；失败（网络/解析）返回 nil。
+/// 查询 npm registry 上 @deepseek-ai/dsh 的目标更新版本；失败（网络/解析）返回 nil。
 /// 同时考虑 `latest`（稳定通道）与 `next`（预发布通道）两个 dist-tag，取其中版本更高者，
 /// 这样 rc/alpha/beta 等 pre-release（如 0.1.0-rc.8，挂在 next 标签）也能被检测到。
-func fetchLatestDshVersion(completion: @escaping (String?) -> Void) {
+/// 返回 `(版本, 是否来自 next 预发布通道)`，用于 UI 标注，让用户知情。
+func fetchLatestDshVersion(completion: @escaping (String?, Bool) -> Void) {
     var req = URLRequest(url: npmRegistryURL)
     req.timeoutInterval = 10
     URLSession.shared.dataTask(with: req) { data, _, error in
         guard error == nil, let data = data,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tags = obj["dist-tags"] as? [String: Any] else {
-            completion(nil)
+            completion(nil, false)
             return
         }
-        // 收集我们关心的 tag 对应的版本号（latest、next），取 semver 最高者
-        var best: String? = nil
-        for key in ["latest", "next"] {
-            guard let v = tags[key] as? String, !v.isEmpty else { continue }
-            if best == nil || isNewerVersion(v, than: best!) { best = v }
+        let latest = tags["latest"] as? String
+        let next = tags["next"] as? String
+        // 候选：latest 优先；next 仅在与 latest 不同时参与比较（同版本时视为稳定通道）
+        var best: String? = latest
+        var fromNext = false
+        if let next = next, !next.isEmpty, next != latest {
+            if best == nil || isNewerVersion(next, than: best!) {
+                best = next
+                fromNext = true
+            }
         }
-        completion(best)
+        completion(best, fromNext)
     }.resume()
 }
 
@@ -685,9 +719,21 @@ func servicePlistXML(program: [String], workspace: String, env: [String: String]
     """
 }
 
+/// 日志轮转：超过上限（默认 20MB）时把当前日志改名为 `.1`（覆盖旧备份），下次启动重建。
+/// 在重启服务前调用：launchd 会在 bootstrap 时按 StandardOutPath 重建文件。
+func rotateLogIfNeeded(_ url: URL, maxBytes: UInt64 = 20 * 1024 * 1024) {
+    guard let attrs = try? fs.attributesOfItem(atPath: url.path),
+          let size = attrs[.size] as? UInt64, size > maxBytes else { return }
+    let backup = URL(fileURLWithPath: url.path + ".1")
+    try? fs.removeItem(at: backup)
+    try? fs.moveItem(at: url, to: backup)
+}
+
 func startService() -> Bool {
     guard let program = buildProgram() else { return false }
     try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
+    // 轮转服务日志（launchd 的 StandardOutPath 无限增长，防止磁盘被日志占满）
+    rotateLogIfNeeded(logFile)
     let env = serviceEnvironment(nodePath: resolveNodePath())
     guard writePlist(servicePlistURL, servicePlistXML(program: program, workspace: workspacePath(), env: env)) else { return false }
     if serviceLoaded() {
@@ -825,7 +871,8 @@ final class InstallPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var timer: Timer?
+    private var timer: Timer?          // 5 秒状态刷新
+    private var updateTimer: Timer?    // 6 小时自动检查更新
 
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var openItem: NSMenuItem!
@@ -838,6 +885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// dsh 更新检测/升级流程状态
     private var latestRemoteVersion: String?      // npm 最新版本
     private var updateAvailable = false           // 是否存在可升级的新版本
+    private var updateIsPreview = false           // 目标版本是否来自 next 预发布通道
     private var checkingUpdates = false           // 正在查询 npm registry
     private var updatingInProgress = false        // 正在执行 npm 升级
     private var updatePanel: InstallPanel?
@@ -886,9 +934,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             self?.checkForUpdates(notifyIfUpToDate: false)
         }
-        let updateTimer = Timer(timeInterval: 6 * 3600, target: self,
-                                selector: #selector(autoCheckUpdates), userInfo: nil, repeats: true)
-        RunLoop.main.add(updateTimer, forMode: .common)
+        updateTimer = Timer(timeInterval: 6 * 3600, target: self,
+                            selector: #selector(autoCheckUpdates), userInfo: nil, repeats: true)
+        RunLoop.main.add(updateTimer!, forMode: .common)
     }
 
     private var whaleIconCache: [ServiceState: NSImage] = [:]
@@ -1059,7 +1107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         operationLock = true
         isStarting = true
         // 无本地 dsh 缓存说明是首次使用，需要 npx 联网下载 → 显示“dsh 安装中”
-        isInstallingDsh = resolveDshLauncher(nodePath: resolveNodePath()) == nil
+        isInstallingDsh = !dshInstalled()
         refresh()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -1181,6 +1229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installInProgress = false
         operationLock = false
         isInstallingDsh = false
+        invalidateDshInfo() // 安装完成，dsh 版本/状态已变化，清除缓存
         refresh()
 
         if code == 0 && dshInstalled() {
@@ -1235,16 +1284,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !checkingUpdates else { return }
         checkingUpdates = true
         refresh()
-        fetchLatestDshVersion { [weak self] remote in
+        fetchLatestDshVersion { [weak self] remote, isPreview in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.checkingUpdates = false
                 if let remote = remote, isNewerVersion(remote, than: local) {
                     // 发现新版本：菜单按钮变「更新 dsh → vX」作为提示，不打扰用户
                     self.latestRemoteVersion = remote
+                    self.updateIsPreview = isPreview
                     self.updateAvailable = true
                 } else {
                     self.latestRemoteVersion = nil
+                    self.updateIsPreview = false
                     self.updateAvailable = false
                     if notifyIfUpToDate {
                         if let remote = remote {
@@ -1322,6 +1373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateLogTimer = nil
         updatingInProgress = false
         operationLock = false
+        invalidateDshInfo() // 升级完成，dsh 版本已变化，清除缓存
         refresh()
 
         // 成功判定：退出码 0 且本地版本确实达到目标版本（防止装到错误版本还报成功）
@@ -1330,6 +1382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if code == 0, reached {
             latestRemoteVersion = nil
             updateAvailable = false
+            updateIsPreview = false
             updatePanel?.setSuccess()
             // 稍作停留展示“更新完成”，然后自动关闭面板并重启服务加载新版
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -1422,7 +1475,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateItem.isEnabled = false
             updateItem.isHidden = false
         } else if updateAvailable, let remote = latestRemoteVersion {
-            updateItem.title = "更新 dsh → \(remote)"
+            // 预发布通道（next 标签）的目标版本标注「预发布」，让用户知情再决定是否升级
+            updateItem.title = updateIsPreview
+                ? "更新 dsh → v\(remote)（预发布）"
+                : "更新 dsh → v\(remote)"
             updateItem.isEnabled = true
             updateItem.isHidden = false
         } else {

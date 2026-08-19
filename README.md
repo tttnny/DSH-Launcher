@@ -67,13 +67,21 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
   `zsh -lic` 抓取你的完整环境写入 plist 的 `EnvironmentVariables`（PATH 剔除易失的
   fnm multishell 临时目录、node 目录置顶）。服务进程与 agent 的 shell 工具因此
   直接可用终端同款工具链（node/npm/pnpm/bun 等），改 `.zshrc` 后重启服务即生效。
+  **注意**：含 token/secret/password/api key/凭据等关键字的环境变量（如
+  `DASHSCOPE_API_KEY`、`AWS_SECRET_ACCESS_KEY`）会被主动剔除，**不会**写入 plist
+  明文落盘——请把 API key 配置在 `~/.dsh` 的 dsh 配置里（dsh 原生做法），
+  不要依赖 .zshrc 环境变量传给服务内的 agent。
 - **升级 dsh 无需改配置**：每次启动服务都会重新解析 node 与最新 dsh 包路径并
   重写 `~/Library/LaunchAgents/com.dsh.web.plist`。
 - **自动更新检测**：App 启动 10 秒后及每 6 小时查询一次 npm registry
-  （`@deepseek-ai/dsh` 的 latest 版本），与本地已装版本对比；发现新版本时菜单栏出现
-  「更新 dsh → vX」并弹窗提示，一键执行 `npm install -g @deepseek-ai/dsh@latest`，
-  完成后自动重启服务加载新版。更新日志：`~/Library/Logs/DSHLauncher/dsh-update.log`。
-- **日志**：`~/Library/Logs/DSHLauncher/dsh-web.log`。
+  （`@deepseek-ai/dsh` 的 `latest` + `next` 两个 dist-tag，取版本更高者），与本地
+  已装版本按 SemVer 2.0 比较（正确识别 rc/alpha/beta 预发布号）。发现新版本时菜单栏
+  出现「更新 dsh → vX」，来自 `next` 预发布通道的目标版本会标注「（预发布）」；
+  点击一键执行 `npm install -g @deepseek-ai/dsh@<目标版本>`（装确切版本，不写死
+  @latest），完成后自动重启服务加载新版。更新日志：
+  `~/Library/Logs/DSHLauncher/dsh-update.log`。
+- **日志轮转**：`dsh-web.log` 超过 20MB 时在下次重启服务前自动轮转为 `.1`，
+  防止无限增长占满磁盘。
 
 ## 卸载
 

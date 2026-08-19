@@ -72,14 +72,21 @@ To switch:
   `EnvironmentVariables` (PATH cleaned of volatile fnm multishell temp dirs, node directory first).
   The service and the agent's shell tools therefore get the same toolchain as your terminal
   (node/npm/pnpm/bun, ...); editing `.zshrc` takes effect after a service restart.
+  **Note**: env vars containing token/secret/password/api-key/credential keywords (e.g.
+  `DASHSCOPE_API_KEY`, `AWS_SECRET_ACCESS_KEY`) are deliberately stripped and never written
+  to the plist in plain text — configure API keys in `~/.dsh` (dsh's native approach),
+  don't rely on `.zshrc` env vars reaching the in-service agent.
 - **dsh upgrades need no config**: every start re-resolves the node path and the latest dsh package
   path and rewrites `~/Library/LaunchAgents/com.dsh.web.plist`.
 - **Auto update check**: 10s after launch and every 6 hours the app queries the npm registry
-  (`@deepseek-ai/dsh` latest) and compares it with the installed version; when a newer version
-  exists the menu shows "Update dsh → vX" with a notification — one click runs
-  `npm install -g @deepseek-ai/dsh@latest` and restarts the service. Update log:
-  `~/Library/Logs/DSHLauncher/dsh-update.log`.
-- **Logs**: `~/Library/Logs/DSHLauncher/dsh-web.log`.
+  (both `latest` and `next` dist-tags of `@deepseek-ai/dsh`, taking the higher semver version)
+  and compares it with the installed version per SemVer 2.0 (correctly handling rc/alpha/beta
+  prerelease numbers). When a newer version exists the menu shows "Update dsh → vX"; targets
+  from the `next` prerelease channel are marked "（预发布/prerelease)". One click runs
+  `npm install -g @deepseek-ai/dsh@<target>` (the exact detected version, not @latest) and
+  restarts the service. Update log: `~/Library/Logs/DSHLauncher/dsh-update.log`.
+- **Log rotation**: `dsh-web.log` is auto-rotated to `.1` before the next service restart once
+  it exceeds 20MB, preventing unbounded disk growth.
 
 ## Uninstall
 
