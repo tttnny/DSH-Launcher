@@ -203,7 +203,8 @@ let servicePlistURL = launchAgentsDir.appendingPathComponent("\(serviceLabel).pl
 let appPlistURL = launchAgentsDir.appendingPathComponent("\(appLabel).plist")
 let guiDomain = "gui/\(getuid())"
 let webURL = URL(string: "http://127.0.0.1:3080")!
-let npmLatestURL = URL(string: "https://registry.npmjs.org/@deepseek-ai/dsh/latest")!
+// 完整包元数据端点：含 dist-tags（latest / next 等），用于检测 dsh 更新
+let npmRegistryURL = URL(string: "https://registry.npmjs.org/@deepseek-ai/dsh")!
 let defaults = UserDefaults.standard
 
 /// 单实例守卫淘汰的重复实例：退出时不应触发“停止服务”
@@ -346,6 +347,27 @@ func killPort3080() -> Bool {
     return port3080Process() == nil
 }
 
+/// 只结束「dsh 占用 3080」的进程（先 SIGTERM，2 秒未释放再 SIGKILL）。
+/// 与 killPort3080 不同：绝不碰非 dsh 程序，保证「退出 App → 只停 dsh」的契约。
+/// 返回是否已无 dsh 占用（无 dsh 占用时视为成功）。
+@discardableResult
+func killDshOnPort3080() -> Bool {
+    guard let (pid, cmd) = port3080Process() else { return true }
+    guard cmd.localizedCaseInsensitiveContains("dsh") ||
+          cmd.localizedCaseInsensitiveContains("deepseek-ai") else { return true }
+    runProcess("/bin/kill", ["\(pid)"])
+    for _ in 0..<20 {
+        if !port3080IsDsh() { return true }
+        usleep(100_000)
+    }
+    runProcess("/bin/kill", ["-9", "\(pid)"])
+    for _ in 0..<10 {
+        if !port3080IsDsh() { return true }
+        usleep(100_000)
+    }
+    return !port3080IsDsh()
+}
+
 /// 日志文件尾部（通用），用于弹窗展示 / 面板实时进度
 func tail(of url: URL, n: Int = 25, placeholder: String = "(日志为空)") -> String {
     guard let data = fs.contents(atPath: url.path),
@@ -421,33 +443,78 @@ func localDshVersion() -> String? {
     return nil
 }
 
-/// 简易 semver 比较：忽略 prerelease/build 后缀，逐段比较主/次/修订号。
+/// Semver 2.0 比较。正确处理 prerelease（rc/alpha/beta 等）：
+/// - `0.1.0-rc.6` < `0.1.0-rc.7`（逐段比较 prerelease 标识，数字按数字比、字符串按 ASCII 比）
+/// - `0.1.0-rc.1` < `0.1.0`（无 prerelease 的版本 > 有 prerelease 的版本）
+/// - 忽略 `+build` 后缀（按 spec build 不参与排序）
 func isNewerVersion(_ a: String, than b: String) -> Bool {
-    func core(_ v: String) -> [Int] {
-        let head = v.split(whereSeparator: { $0 == "-" || $0 == "+" }).first.map(String.init) ?? ""
-        return head.split(separator: ".").compactMap { Int($0) }
+    // 解析为 (核心号 [Int], prerelease 标识 [String])
+    func parse(_ v: String) -> ([Int], [String]) {
+        let main = v.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let core = String(main[0]).split(separator: ".").compactMap { Int($0) }
+        let pre = main.count > 1 ? String(main[1]) : ""
+        let preClean = pre.split(separator: "+", maxSplits: 1).first.map(String.init) ?? ""
+        let preIds = preClean.isEmpty ? [] : preClean.split(separator: ".").map(String.init)
+        return (core, preIds)
     }
-    let x = core(a), y = core(b)
-    for i in 0..<max(x.count, y.count) {
-        let xi = i < x.count ? x[i] : 0
-        let yi = i < y.count ? y[i] : 0
-        if xi != yi { return xi > yi }
+    // 比较核心号，-1/0/1
+    func cmpCore(_ x: [Int], _ y: [Int]) -> Int {
+        for i in 0..<max(x.count, y.count) {
+            let xi = i < x.count ? x[i] : 0
+            let yi = i < y.count ? y[i] : 0
+            if xi != yi { return xi < yi ? -1 : 1 }
+        }
+        return 0
     }
-    return false
+    // 比较 prerelease 标识列表，-1/0/1（spec：无 prerelease > 有 prerelease）
+    func cmpPre(_ x: [String], _ y: [String]) -> Int {
+        if x.isEmpty && y.isEmpty { return 0 }
+        if x.isEmpty { return 1 }
+        if y.isEmpty { return -1 }
+        for i in 0..<max(x.count, y.count) {
+            if i >= x.count { return -1 } // 短的更小
+            if i >= y.count { return 1 }
+            let xi = x[i], yi = y[i]
+            let xIsNum = Int(xi) != nil, yIsNum = Int(yi) != nil
+            if xIsNum && yIsNum {
+                let xn = Int(xi)!, yn = Int(yi)!
+                if xn != yn { return xn < yn ? -1 : 1 }
+            } else if xIsNum {
+                return -1 // 数字标识 < 字符串标识
+            } else if yIsNum {
+                return 1
+            } else if xi != yi {
+                return xi < yi ? -1 : 1
+            }
+        }
+        return 0
+    }
+    let (ac, ap) = parse(a), (bc, bp) = parse(b)
+    let c = cmpCore(ac, bc)
+    if c != 0 { return c > 0 }
+    return cmpPre(ap, bp) > 0
 }
 
-/// 查询 npm registry 上 @deepseek-ai/dsh 的 latest 版本号；失败（网络/解析）返回 nil。
+/// 查询 npm registry 上 @deepseek-ai/dsh 的目标更新版本号；失败（网络/解析）返回 nil。
+/// 同时考虑 `latest`（稳定通道）与 `next`（预发布通道）两个 dist-tag，取其中版本更高者，
+/// 这样 rc/alpha/beta 等 pre-release（如 0.1.0-rc.8，挂在 next 标签）也能被检测到。
 func fetchLatestDshVersion(completion: @escaping (String?) -> Void) {
-    var req = URLRequest(url: npmLatestURL)
+    var req = URLRequest(url: npmRegistryURL)
     req.timeoutInterval = 10
     URLSession.shared.dataTask(with: req) { data, _, error in
         guard error == nil, let data = data,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let v = obj["version"] as? String, !v.isEmpty else {
+              let tags = obj["dist-tags"] as? [String: Any] else {
             completion(nil)
             return
         }
-        completion(v)
+        // 收集我们关心的 tag 对应的版本号（latest、next），取 semver 最高者
+        var best: String? = nil
+        for key in ["latest", "next"] {
+            guard let v = tags[key] as? String, !v.isEmpty else { continue }
+            if best == nil || isNewerVersion(v, than: best!) { best = v }
+        }
+        completion(best)
     }.resume()
 }
 
@@ -669,13 +736,12 @@ func appAutoStartEnabled() -> Bool {
 
 // MARK: - 安装进度面板
 
-/// dsh 安装进度面板：spinner + 实时日志（来自服务日志文件尾部）+ 后台运行按钮。
+/// dsh 安装/更新进度面板：spinner + 实时日志（来自日志文件尾部），可最小化。
 final class InstallPanel: NSPanel {
     private let spinner = NSProgressIndicator()
     private let titleLabel = NSTextField(labelWithString: "正在安装 dsh…")
     private let statusLabel = NSTextField(labelWithString: "首次安装需联网下载，请稍候…")
     private let logView = NSTextView()
-    private let bgButton = NSButton(title: "后台运行", target: nil, action: nil)
     private let doneTitle: String
     private let doneStatus: String
     private let failTitle: String
@@ -691,7 +757,7 @@ final class InstallPanel: NSPanel {
         self.doneStatus = doneStatus
         self.failTitle = failTitle
         super.init(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
-                   styleMask: [.titled, .closable],
+                   styleMask: [.titled, .closable, .miniaturizable],
                    backing: .buffered, defer: false)
         self.title = panelTitle
         isFloatingPanel = true
@@ -725,17 +791,11 @@ final class InstallPanel: NSPanel {
         scroll.borderType = .bezelBorder
         logView.frame = NSRect(x: 0, y: 0, width: 424, height: 196)
 
-        bgButton.frame = NSRect(x: 20, y: 12, width: 110, height: 28)
-        bgButton.bezelStyle = .rounded
-        bgButton.target = self
-        bgButton.action = #selector(backgroundTapped)
-
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 320))
         content.addSubview(spinner)
         content.addSubview(titleLabel)
         content.addSubview(statusLabel)
         content.addSubview(scroll)
-        content.addSubview(bgButton)
         contentView = content
     }
 
@@ -758,10 +818,6 @@ final class InstallPanel: NSPanel {
         spinner.stopAnimation(nil)
         titleLabel.stringValue = failTitle
         statusLabel.stringValue = reason
-    }
-
-    @objc private func backgroundTapped() {
-        close() // 面板关闭，流程继续在后台执行，完成后自动处理
     }
 }
 
@@ -791,6 +847,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var installInProgress = false
     private var installPanel: InstallPanel?
     private var installLogTimer: Timer?
+
+    /// 全局流程互斥锁：安装 dsh / 更新 dsh / 重启服务 三者互斥，
+    /// 防止并发写 LaunchAgent plist 或并发 bootstrap/kickstart 导致服务状态错乱。
+    private var operationLock = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 单实例守卫：菜单栏 App 重复打开会出现多个图标，保留最早的那个。
@@ -992,54 +1052,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 实际执行重启：停旧实例 + 兜底杀端口（幂等），再拉起并轮询健康检查。
+    /// 整个流程在后台队列执行：startService 里的 `zsh -lic` 抓环境最多可等 8 秒，
+    /// 健康检查每秒 curl 一次，绝不能阻塞主线程（菜单栏 App 会假死）。
     func performRestart() {
-        stopService()     // 幂等：停 launchd 任务（App 托管时）
-        killPort3080()    // 兜底：无论谁占 3080，重启前都释放端口
+        guard !operationLock else { return } // 安装/更新/重启互斥
+        operationLock = true
         isStarting = true
         // 无本地 dsh 缓存说明是首次使用，需要 npx 联网下载 → 显示“dsh 安装中”
         isInstallingDsh = resolveDshLauncher(nodePath: resolveNodePath()) == nil
         refresh()
-        var attempts = 0
-        func tryStart() {
-            attempts += 1
-            guard startService() else {
-                if attempts < 6 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { tryStart() }
-                } else {
-                    finishStartup(ok: false, message: "无法写入 LaunchAgent 或启动服务（已重试 6 次）。\n\n日志尾部：\n\(logTail())")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            stopService()   // 幂等：停 launchd 任务（App 托管时）
+            killPort3080()  // 兜底：无论谁占 3080，重启前都释放端口
+            var attempts = 0
+            while true {
+                attempts += 1
+                if startService() { break }
+                if attempts >= 6 {
+                    DispatchQueue.main.async {
+                        self.finishStartup(ok: false, message: "无法写入 LaunchAgent 或启动服务（已重试 6 次）。\n\n日志尾部：\n\(logTail())")
+                    }
+                    return
                 }
-                return
+                Thread.sleep(forTimeInterval: 0.5)
             }
             // 复用 isInstallingDsh：无本地 dsh 缓存 → 首次联网下载，放宽健康检查窗口
             let hasCache = !isInstallingDsh
             let window: TimeInterval = hasCache ? 8 : 120
-            healthCheck(timeout: window) { [weak self] ok in
-                self?.finishStartup(ok: ok, message: ok ? nil :
-                    "服务未能启动\(hasCache ? "。" : "，首次使用需联网下载 dsh，请确认网络可用。")\n\n日志尾部：\n\(logTail())")
+            self.healthCheck(timeout: window) { ok in
+                DispatchQueue.main.async {
+                    self.finishStartup(ok: ok, message: ok ? nil :
+                        "服务未能启动\(hasCache ? "。" : "，首次使用需联网下载 dsh，请确认网络可用。")\n\n日志尾部：\n\(logTail())")
+                }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { tryStart() }
     }
 
     /// 结束“正在启动/安装中”状态：失败时弹日志尾部，随后刷新 UI。
     func finishStartup(ok: Bool, message: String?) {
         isStarting = false
         isInstallingDsh = false
+        operationLock = false
         if !ok, let message = message {
             showAlert(title: "服务启动失败", message: message)
         }
         refresh()
     }
 
-    /// 轮询健康检查：每秒探测一次 HTTP 3080，直到可用或超时。
+    /// 后台轮询健康检查：每秒探测一次 HTTP 3080，直到可用或超时。
+    /// 探测（curl）在后台线程执行，完成回调回主线程。
     func healthCheck(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
-        let deadline = Date().addingTimeInterval(timeout)
-        func poll() {
-            if portServing() { completion(true); return }
-            if Date() >= deadline { completion(false); return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { poll() }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !portServing() && Date() < deadline {
+                Thread.sleep(forTimeInterval: 1)
+            }
+            let ok = portServing()
+            DispatchQueue.main.async { completion(ok) }
         }
-        poll()
     }
 
     @objc func doRestart() {
@@ -1052,7 +1123,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 完成后自动拉起服务（无需重启 App）。与官方全局安装方式一致，
     /// 安装后 `which dsh` 可找到，App 的 resolveDshLauncher 也会优先复用全局版。
     @objc func installDsh() {
-        guard !installInProgress else { return }
+        // 安装面板被最小化时先恢复显示（菜单栏 App 无 Dock 图标，靠菜单项找回）
+        if let panel = installPanel, panel.isMiniaturized {
+            panel.deminiaturize(nil)
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
+        guard !installInProgress, !operationLock else { return }
         let node = resolveNodePath()
         guard let npm = resolveNpmPath(nodePath: node) else {
             showAlert(title: "无法安装 dsh",
@@ -1060,6 +1138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         installInProgress = true
+        operationLock = true
         isInstallingDsh = true
         refresh()
 
@@ -1100,6 +1179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installLogTimer?.invalidate()
         installLogTimer = nil
         installInProgress = false
+        operationLock = false
         isInstallingDsh = false
         refresh()
 
@@ -1119,8 +1199,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: dsh 更新（自动检测 + 一键升级）
 
-    /// 菜单「更新 dsh / 检查更新」：已有可用更新则直接执行升级，否则手动检查一次。
+    /// 菜单「更新 dsh / 检查更新」：面板被最小化时先恢复显示
+    /// （菜单栏 App 无 Dock 图标，最小化后的窗口只能靠这里找回来）；
+    /// 已有可用更新则直接执行升级，否则手动检查一次。
     @objc func checkUpdateTapped() {
+        if let panel = updatePanel, panel.isMiniaturized {
+            panel.deminiaturize(nil)
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
         if updateAvailable {
             performUpdate()
         } else {
@@ -1173,10 +1261,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 一键升级：`npm install -g @deepseek-ai/dsh@latest`（与「安装 dsh」相同的官方
-    /// 全局安装方式），进度面板实时展示日志，完成后自动重启服务加载新版。
+    /// 一键升级：安装检测到的目标版本（`npm install -g @deepseek-ai/dsh@<目标版本>`），
+    /// 进度面板实时展示日志，完成后自动重启服务加载新版。
+    /// 注意：必须安装确切的目标版本（可能是 next 通道的 rc 版），不能写死 @latest，
+    /// 否则 latest 标签（如 rc.7）与检测目标（如 rc.8）不一致，会导致装完仍提示更新。
     func performUpdate() {
-        guard !updatingInProgress else { return }
+        guard !updatingInProgress, !operationLock else { return }
+        guard let target = latestRemoteVersion, !target.isEmpty else {
+            showAlert(title: "无法更新 dsh",
+                      message: "未找到目标更新版本，请先点击「检查更新」。")
+            return
+        }
         let node = resolveNodePath()
         guard let npm = resolveNpmPath(nodePath: node) else {
             showAlert(title: "无法更新 dsh",
@@ -1184,6 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         updatingInProgress = true
+        operationLock = true
         refresh()
 
         // 清空旧更新日志，避免面板显示上一次的内容
@@ -1191,7 +1287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let panel = InstallPanel(panelTitle: "更新 dsh",
                                  statusTitle: "正在更新 dsh…",
-                                 statusText: "正在从 npm 下载并安装最新版本…",
+                                 statusText: "正在下载并安装 \(target)…",
                                  doneTitle: "dsh 更新完成",
                                  doneStatus: "即将自动重启服务…",
                                  failTitle: "dsh 更新失败")
@@ -1205,14 +1301,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateLogTimer = t
 
         // 后台执行全局升级（timeout 180s 防卡死），使用完整终端环境
+        let pkg = "@deepseek-ai/dsh@\(target)"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var env = ProcessInfo.processInfo.environment
             for (k, v) in serviceEnvironment(nodePath: node) {
                 env[k] = v
             }
-            let code = runProcessLogging(node, [npm, "install", "-g", "@deepseek-ai/dsh@latest"],
+            let code = runProcessLogging(node, [npm, "install", "-g", pkg],
                                          timeout: 180, env: env, logURL: updateLogFile)
-            DispatchQueue.main.async { self?.updateFinished(code: code) }
+            DispatchQueue.main.async { self?.updateFinished(code: code, target: target) }
         }
     }
 
@@ -1220,13 +1317,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updatePanel?.updateLog(updateLogTail(30))
     }
 
-    private func updateFinished(code: Int32) {
+    private func updateFinished(code: Int32, target: String) {
         updateLogTimer?.invalidate()
         updateLogTimer = nil
         updatingInProgress = false
+        operationLock = false
         refresh()
 
-        if code == 0, localDshVersion() != nil {
+        // 成功判定：退出码 0 且本地版本确实达到目标版本（防止装到错误版本还报成功）
+        let installed = localDshVersion()
+        let reached = installed != nil && !isNewerVersion(target, than: installed!)
+        if code == 0, reached {
             latestRemoteVersion = nil
             updateAvailable = false
             updatePanel?.setSuccess()
@@ -1238,7 +1339,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else {
             let tail = updateLogTail(20)
-            updatePanel?.setFailure("更新失败（退出码 \(code)），请检查网络后重试。\n\n\(tail)")
+            let detail = installed.map { "（当前本地版本：\($0)）" } ?? "（未检测到本地版本）"
+            updatePanel?.setFailure("更新失败（退出码 \(code)）\(detail)。\n\n\(tail)")
         }
     }
 
@@ -1268,15 +1370,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 退出前停止服务：先 bootout 停掉 App 托管的 launchd 任务，
-    /// 再杀掉 3080 端口上的进程（覆盖外部实例/孤儿进程，保证退出后端口必释放）。
+    /// 再杀掉 3080 端口上的 **dsh** 进程（覆盖外部实例/孤儿进程，保证退出后 dsh 必停）。
+    /// 注意：只杀 dsh，绝不碰非 dsh 程序（契约是「退出停止 dsh 服务」）。
     /// 被单实例守卫淘汰的重复实例不执行此逻辑。
     func applicationWillTerminate(_ notification: Notification) {
         if !isDuplicateExit {
             stopService()
             // bootout 是异步卸载：等待任务完全消失再退出，避免服务进程残留（最多等 1 秒）
             for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
-            // 兜底：无论谁在跑 3080，退出都杀掉，确保「退出 App → 服务停止」
-            killPort3080()
+            killDshOnPort3080()
         }
     }
 
