@@ -49,6 +49,9 @@ func runProcessLogging(_ launchPath: String, _ args: [String], timeout: TimeInte
     p.arguments = args
     p.environment = env
 
+    // 确保日志文件的父目录存在（否则 createFile 静默失败，安装/更新会报失败且无日志）
+    let logDir = logURL.deletingLastPathComponent()
+    try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
     // 确保日志文件存在，并以追加写模式打开（子进程 stdout/stderr 直接落盘）
     fs.createFile(atPath: logURL.path, contents: nil)
     guard let handle = try? FileHandle(forWritingTo: logURL) else { return -1 }
@@ -63,6 +66,24 @@ func runProcessLogging(_ launchPath: String, _ args: [String], timeout: TimeInte
     p.waitUntilExit()
     handle.closeFile()
     return p.terminationStatus
+}
+
+/// 清理全局 `@deepseek-ai` 包目录下的 npm 残留临时目录。
+/// npm 安装/卸载异常中断时，会在包目录下留下 `<包名>-<6位随机>` 形式目录
+/// （如 `.dsh-Attf9w6e`），内部可能堆积数万个文件。一旦超过 npm 的安全删除阈值
+/// （SAFE_DELETE_BULK_CONFIRM_REQUIRED，默认 500 个），后续 `npm install -g` 升级
+/// 会被安全保护拒绝、直接退出码 1，且不产生任何安装输出——用户看到的就是
+/// 「更新失败且无日志」。安装/更新 dsh 前调用，删除 @deepseek-ai 下除 `dsh` 外的
+/// 所有条目（含这类残留与历史版本），保证 npm 写目录时不会被拦截。
+func cleanDshStagingResidue() {
+    let node = resolveNodePath()
+    let nodeDir = (node as NSString).deletingLastPathComponent
+    guard nodeDir != "/usr/bin" else { return }
+    let scopeDir = (nodeDir as NSString).deletingLastPathComponent + "/lib/node_modules/@deepseek-ai"
+    guard let entries = try? fs.contentsOfDirectory(atPath: scopeDir) else { return }
+    for e in entries where e != "dsh" {
+        try? fs.removeItem(atPath: "\(scopeDir)/\(e)")
+    }
 }
 
 // MARK: - dsh 官方鲸鱼图标（菜单栏状态图标）
@@ -1209,6 +1230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 关键：使用完整终端环境（以 App 当前环境为底，叠加 zsh 抓取的完整环境），
         // 保证依赖 native 编译（make/clang/python）的包能和服务运行时一样正常安装。
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 先清理 @deepseek-ai 目录下的 npm 残留（如 .dsh-xxxxxx 临时目录），
+            // 避免残留文件数超过 npm 安全删除阈值导致 install 被拒绝
+            cleanDshStagingResidue()
             var env = ProcessInfo.processInfo.environment
             for (k, v) in serviceEnvironment(nodePath: node) {
                 env[k] = v
@@ -1354,6 +1378,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 后台执行全局升级（timeout 180s 防卡死），使用完整终端环境
         let pkg = "@deepseek-ai/dsh@\(target)"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 先清理 @deepseek-ai 目录下的 npm 残留，防止 safe-delete 阈值拦截升级
+            cleanDshStagingResidue()
             var env = ProcessInfo.processInfo.environment
             for (k, v) in serviceEnvironment(nodePath: node) {
                 env[k] = v
