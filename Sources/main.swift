@@ -756,7 +756,94 @@ func rotateLogIfNeeded(_ url: URL, maxBytes: UInt64 = 20 * 1024 * 1024) {
     try? fs.moveItem(at: url, to: backup)
 }
 
+/// 向服务日志追加一行（供补丁等启动期事件留痕）。
+func appendToServiceLog(_ text: String) {
+    try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
+    guard let handle = try? FileHandle(forWritingTo: logFile) else { return }
+    handle.seekToEndOfFile()
+    handle.write("[DSH Launcher] \(text)\n".data(using: .utf8) ?? Data())
+    handle.closeFile()
+}
+
+/// 定位 @deepseek-ai/dsh-tool-cordis 的 lib/index.js（npm 全局 / pnpm 布局均覆盖）。
+func dshToolCordisIndexPath() -> String? {
+    let node = resolveNodePath()
+    let nodeDir = (node as NSString).deletingLastPathComponent
+    guard nodeDir != "/usr/bin" else { return nil }
+    let globalScope = (nodeDir as NSString).deletingLastPathComponent + "/lib/node_modules/@deepseek-ai"
+    // 候选 1：扁平全局布局 node_modules/@deepseek-ai/dsh-tool-cordis/lib/index.js
+    let flat = "\(globalScope)/dsh-tool-cordis/lib/index.js"
+    if fs.fileExists(atPath: flat) { return flat }
+    // 候选 2：dsh 嵌套依赖 node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-cordis/lib/index.js
+    let nested = "\(globalScope)/dsh/node_modules/@deepseek-ai/dsh-tool-cordis/lib/index.js"
+    if fs.fileExists(atPath: nested) { return nested }
+    // 候选 3：pnpm 布局 node_modules/@deepseek-ai/dsh/node_modules/.pnpm/@deepseek-ai+dsh-tool-cordis@*/node_modules/@deepseek-ai/dsh-tool-cordis/lib/index.js
+    let pnpmDir = "\(globalScope)/dsh/node_modules/.pnpm"
+    if let entries = try? fs.contentsOfDirectory(atPath: pnpmDir) {
+        for e in entries where e.hasPrefix("@deepseek-ai+dsh-tool-cordis@") {
+            let cand = "\(pnpmDir)/\(e)/node_modules/@deepseek-ai/dsh-tool-cordis/lib/index.js"
+            if fs.fileExists(atPath: cand) { return cand }
+        }
+    }
+    return nil
+}
+
+/// 适配「创造模式」多预设共存：给 @deepseek-ai/dsh-tool-cordis 打幂等补丁。
+///
+/// 背景：dsh-tool-cordis 挂载时向进程全局单例 cordisInspect 注册一组 Host
+/// inspect provider（Service/Event/Builtin/Tool）。第二个带 tool-cordis 的 agent
+/// preset（如「PTC-创造 混合模式」ptc-cordis 与「创造模式」cordis 并存）再挂载时，
+/// 注册表已含同名 provider，抛 "Host Cordis inspect provider ... already registered"，
+/// 导致第二个预设挂载失败、Web 会话秒退为标准模式。
+///
+/// 修复：apply() 注册前先列出已注册的 host provider，同 id 幂等跳过。
+/// provider 是同一包的静态目录描述，重复注册无意义也无害；
+/// 工具（cordis_define 等）与提示按 scope 分层各自注册，不受影响。
+///
+/// dsh 升级（npm install -g）会覆盖 node_modules 使补丁丢失，因此每次
+/// 启动/重启服务前自动检查并重打，保证「创造模式」始终可用。
+/// @returns true=本次应用了补丁；false=无需应用（已打过 / dsh 缺失 / 结构不匹配）。
+func applyToolCordisPatchIfNeeded() -> Bool {
+    let marker = "PATCH: inspect provider 注册表是进程全局单例"
+    let oldLine = "\tfor (const provider of hostInspectProviders(ctx)) ctx.effect(() => ctx.cordisInspect.register(provider), `tool-cordis: inspect ${provider.manifest.id}`);"
+    let newBlock = """
+    \t// PATCH: inspect provider 注册表是进程全局单例（dsh-cordis-host-runner），
+    \t// 同 id 已被其他预设（如 cordis / ptc-cordis）注册时直接抛
+    \t// "already registered"，导致第二个带 tool-cordis 的预设挂载失败。
+    \t// provider 是同一包的静态目录描述，重复注册无意义也无害；
+    \t// 工具与提示仍按 scope 分层各自注册，不受影响。这里幂等跳过。
+    \tconst existingHostInspect = new Set(ctx.cordisInspect.list().filter(p => p.platform === "host").map(p => p.id));
+    \tfor (const provider of hostInspectProviders(ctx)) {
+    \t\tif (existingHostInspect.has(provider.manifest.id)) continue;
+    \t\tctx.effect(() => ctx.cordisInspect.register(provider), `tool-cordis: inspect ${provider.manifest.id}`);
+    \t}
+    """
+    guard let target = dshToolCordisIndexPath() else { return false }
+    guard let content = try? String(contentsOfFile: target, encoding: .utf8) else { return false }
+    if content.contains(marker) { return false } // 已打过补丁，幂等跳过
+    guard content.contains(oldLine) else {
+        appendToServiceLog("tool-cordis 补丁：未匹配到注册行（dsh 版本结构可能已变化），跳过，创造模式多预设可能不可用")
+        return false
+    }
+    let backup = target + ".bak"
+    try? fs.removeItem(atPath: backup)
+    try? fs.copyItem(atPath: target, toPath: backup)
+    let patched = content.replacingOccurrences(of: oldLine, with: newBlock)
+    do {
+        try patched.write(toFile: target, atomically: true, encoding: .utf8)
+        return true
+    } catch {
+        appendToServiceLog("tool-cordis 补丁写入失败：\(error.localizedDescription)")
+        return false
+    }
+}
+
 func startService() -> Bool {
+    // 适配创造模式：每次启动/重启服务前检查并应用 dsh-tool-cordis 幂等补丁
+    // （dsh 升级覆盖 node_modules 后自动重打，保证 cordis / ptc-cordis 多预设共存）
+    if applyToolCordisPatchIfNeeded() {
+        appendToServiceLog("已应用 dsh-tool-cordis 幂等补丁（适配创造模式多预设共存）")
+    }
     guard let program = buildProgram() else { return false }
     try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
     // 轮转服务日志（launchd 的 StandardOutPath 无限增长，防止磁盘被日志占满）
