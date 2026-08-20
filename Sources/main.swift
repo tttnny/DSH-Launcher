@@ -708,7 +708,9 @@ func buildProgram() -> [String]? {
     } else {
         return nil
     }
-    return base + ["web", "--port", "3080"]
+    // --no-open：服务由本 App 托管/自愈拉起时不应每次弹浏览器；
+    // 需要打开 UI 时用户直接点菜单栏「打开 Web UI」。
+    return base + ["web", "--port", "3080", "--no-open"]
 }
 
 func servicePlistXML(program: [String], workspace: String, env: [String: String]) -> String {
@@ -732,7 +734,11 @@ func servicePlistXML(program: [String], workspace: String, env: [String: String]
     \(envXML)
       </dict>
       <key>RunAtLoad</key><false/>
-      <key>KeepAlive</key><false/>
+      <key>KeepAlive</key>
+      <dict>
+        <key>SuccessfulExit</key><false/>
+      </dict>
+      <key>ThrottleInterval</key><integer>10</integer>
       <key>StandardOutPath</key><string>\(escapeXml(logFile.path))</string>
       <key>StandardErrorPath</key><string>\(escapeXml(logFile.path))</string>
     </dict>
@@ -1471,7 +1477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .installing: statusLine.title = "服务：dsh 安装中…"
         case .notInstalled: statusLine.title = "服务：dsh 未安装"
         case .portBusy: statusLine.title = "服务：端口 3080 被其他程序占用"
-        case .crashed: statusLine.title = "服务：启动失败（点“重启服务”重试）"
+        case .crashed: statusLine.title = "服务：dsh 异常退出，launchd 正在自动重启…"
         case .stopped: statusLine.title = "服务：未运行\(envNote)"
         }
         // 「安装 dsh」：仅未安装/安装失败时显示；安装中禁用并改名
