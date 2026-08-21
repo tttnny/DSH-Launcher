@@ -3,7 +3,7 @@
 #
 # 背景：@deepseek-ai/dsh-tool-cordis 挂载时向进程全局单例 cordisInspect 注册
 # 一组 Host inspect provider（Service/Event/Builtin/Tool）。第二个带 tool-cordis
-# 的 agent preset（例如「PTC-创造 混合模式」ptc-cordis 与「创造模式」cordis 并存）
+# 的 agent preset（例如「PTC-创造 混合模式」ptc-creative-cordis 与「创造模式」cordis 并存）
 # 再挂载时，注册表已含同名 provider，抛 "Host Cordis inspect provider ... already
 # registered"，导致第二个预设挂载失败、GUI 秒退为标准模式。
 #
@@ -32,26 +32,29 @@ fi
 
 cp "$TARGET" "$TARGET.bak"
 
-# 用 node 做精确替换（避免 sed 转义地狱）
+# 用 node 做精确替换（避免 sed 转义地狱）。
+# 注意：old/neu 用双引号字符串拼接，${...} 是字面量而非插值；
+# 且 node -e 末尾必须传入 "$TARGET"（process.argv[1]）。
 node -e '
 const fs = require("fs");
 const p = process.argv[1];
 let s = fs.readFileSync(p, "utf8");
-const old = `\tfor (const provider of hostInspectProviders(ctx)) ctx.effect(() => ctx.cordisInspect.register(provider), \`tool-cordis: inspect ${provider.manifest.id}\`);`;
-const neu = `\t// PATCH: inspect provider 注册表是进程全局单例（dsh-cordis-host-runner），
-\t// 同 id 已被其他预设（如 cordis / ptc-cordis）注册时直接抛
-\t// "already registered"，导致第二个带 tool-cordis 的预设挂载失败。
-\t// provider 是同一包的静态目录描述，重复注册无意义也无害；
-\t// 工具与提示仍按 scope 分层各自注册，不受影响。这里幂等跳过。
-\tconst existingHostInspect = new Set(ctx.cordisInspect.list().filter(p => p.platform === "host").map(p => p.id));
-\tfor (const provider of hostInspectProviders(ctx)) {
-\t\tif (existingHostInspect.has(provider.manifest.id)) continue;
-\t\tctx.effect(() => ctx.cordisInspect.register(provider), \`tool-cordis: inspect ${provider.manifest.id}\`);
-\t}`;
+const old = "\tfor (const provider of hostInspectProviders(ctx)) ctx.effect(() => ctx.cordisInspect.register(provider), `tool-cordis: inspect ${provider.manifest.id}`);";
+const neu =
+  "\t// PATCH: inspect provider 注册表是进程全局单例（dsh-cordis-host-runner），\n" +
+  "\t// 同 id 已被其他预设（如 cordis / ptc-creative-cordis）注册时直接抛\n" +
+  "\t// \"already registered\"，导致第二个带 tool-cordis 的预设挂载失败。\n" +
+  "\t// provider 是同一包的静态目录描述，重复注册无意义也无害；\n" +
+  "\t// 工具与提示仍按 scope 分层各自注册，不受影响。这里幂等跳过。\n" +
+  "\tconst existingHostInspect = new Set(ctx.cordisInspect.list().filter(p => p.platform === \"host\").map(p => p.id));\n" +
+  "\tfor (const provider of hostInspectProviders(ctx)) {\n" +
+  "\t\tif (existingHostInspect.has(provider.manifest.id)) continue;\n" +
+  "\t\tctx.effect(() => ctx.cordisInspect.register(provider), `tool-cordis: inspect ${provider.manifest.id}`);\n" +
+  "\t}";
 if (!s.includes(old)) { console.error("未匹配到待替换代码，请检查 dsh 版本"); process.exit(2); }
 s = s.replace(old, neu);
 fs.writeFileSync(p, s);
 console.log("补丁已应用：", p);
-'
+' "$TARGET"
 node --check "$TARGET" && echo "语法校验通过"
 echo "完成：重新启动 dsh 服务（或等 KeepAlive 自愈）后生效。"
