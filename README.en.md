@@ -49,6 +49,7 @@ The output `dist/DSH Launcher.app` is directly runnable — copy it anywhere (e.
 | Status line | Whether the service is running (launchd-managed / external instance on port 3080) |
 | Open Web UI (⌘O) | Opens http://127.0.0.1:3080 in the browser |
 | Install dsh (shown only when not installed) | Installs dsh on first use with a live progress panel; starts the service automatically when done |
+| Uninstall dsh (shown only when installed) | After confirmation, stops the service, runs `npm uninstall -g @deepseek-ai/dsh`, and clears the dsh npx cache. Two modes: **Uninstall only** (keeps `~/.dsh` for seamless reinstalling) or **Full uninstall** (also deletes `~/.dsh` data and the service LaunchAgent config — nothing left behind, irreversible) |
 | Restart service | Always available: running = restart; failed/stopped = start; port taken by an external instance = dialog explaining who owns it |
 | Update dsh / Check for updates | Auto-checks the npm registry for a newer dsh (10s after launch, then every 6 hours, silently): when available the menu becomes "Update dsh → vX"; one click upgrades (`npm install -g @deepseek-ai/dsh@latest`) and restarts the service. Otherwise click to check manually |
 | dsh version: vX | Read-only info line showing the installed dsh version ("Not installed" when missing) |
@@ -88,7 +89,22 @@ To switch:
 - **Log rotation**: `dsh-web.log` is auto-rotated to `.1` before the next service restart once
   it exceeds 20MB, preventing unbounded disk growth.
 
-## Uninstall
+## Uninstall dsh
+
+Done with dsh? Click **Uninstall dsh** in the menu (shown only while installed), then pick one:
+
+- **Uninstall only (keep ~/.dsh)**: stops the service → runs
+  `npm uninstall -g @deepseek-ai/dsh` and clears the dsh npx cache, returning to the
+  "not installed" state. The data directory `~/.dsh` (sessions, config) is untouched —
+  click **Install dsh** anytime to reinstall seamlessly.
+- **Full uninstall (delete ~/.dsh)**: on top of the above, also deletes the data
+  directory `~/.dsh` and the service LaunchAgent config (`com.dsh.web.plist`) — for
+  when you are done for good and want nothing left behind.
+  **Irreversible; back up any sessions you need first.**
+
+Uninstall log: `~/Library/Logs/DSHLauncher/dsh-uninstall.log`.
+
+## Uninstall the app
 
 ```bash
 launchctl bootout gui/$(id -u)/com.dsh.web 2>/dev/null

@@ -86,6 +86,31 @@ func cleanDshStagingResidue() {
     }
 }
 
+/// 向卸载日志追加一行（卸载面板实时展示进度用）。
+func appendToUninstallLog(_ text: String) {
+    guard let handle = try? FileHandle(forWritingTo: uninstallLogFile) else { return }
+    handle.seekToEndOfFile()
+    handle.write("[DSH Launcher] \(text)\n".data(using: .utf8) ?? Data())
+    handle.closeFile()
+}
+
+/// 清理 npx 缓存（~/.npm/_npx/<hash>）里的 dsh 包目录。
+/// 只删 dsh 包本身，不动缓存目录里可能存在的其他包。
+/// 背景：App 判定「已安装」的条件是全局安装或 npx 缓存任一命中，
+/// 只卸载全局包而留下 npx 缓存，会让 App 一直视为已安装、
+/// 菜单回不到「安装 dsh」的首次安装流程。卸载流程收尾时调用。
+func removeNpxCachedDsh() {
+    let npxRoot = homeDir.appendingPathComponent(".npm/_npx").path
+    guard let entries = try? fs.contentsOfDirectory(atPath: npxRoot) else { return }
+    for e in entries {
+        let pkg = "\(npxRoot)/\(e)/node_modules/@deepseek-ai/dsh"
+        guard fs.fileExists(atPath: pkg) else { continue }
+        if (try? fs.removeItem(atPath: pkg)) != nil {
+            appendToUninstallLog("已清理 npx 缓存：\(pkg)")
+        }
+    }
+}
+
 // MARK: - dsh 官方鲸鱼图标（菜单栏状态图标）
 // 直接解析打包在 App 内的官方 favicon.svg（DeepSeek Harness 源码
 // apps/web/public/favicon.svg，即 @deepseek-ai/dsh-web-frontend/dist/favicon.svg），
@@ -218,6 +243,7 @@ let logDir = homeDir.appendingPathComponent("Library/Logs/DSHLauncher", isDirect
 let logFile = logDir.appendingPathComponent("dsh-web.log")
 let installLogFile = logDir.appendingPathComponent("dsh-install.log")
 let updateLogFile = logDir.appendingPathComponent("dsh-update.log")
+let uninstallLogFile = logDir.appendingPathComponent("dsh-uninstall.log")
 let serviceLabel = "com.dsh.web"
 let appLabel = "com.dsh.menubar"
 let servicePlistURL = launchAgentsDir.appendingPathComponent("\(serviceLabel).plist")
@@ -414,6 +440,11 @@ func installLogTail(_ n: Int = 30) -> String {
 /// 更新日志尾部，用于更新面板实时展示进度
 func updateLogTail(_ n: Int = 30) -> String {
     tail(of: updateLogFile, n: n, placeholder: "(等待输出…)")
+}
+
+/// 卸载日志尾部，用于卸载面板实时展示进度
+func uninstallLogTail(_ n: Int = 30) -> String {
+    tail(of: uninstallLogFile, n: n, placeholder: "(等待输出…)")
 }
 
 enum ServiceState: Hashable { case running, starting, installing, notInstalled, portBusy, crashed, stopped }
@@ -992,6 +1023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var openItem: NSMenuItem!
     private var restartItem: NSMenuItem!
     private var installItem: NSMenuItem!
+    private var uninstallItem: NSMenuItem!
     private var updateItem: NSMenuItem!
     private var versionItem: NSMenuItem!
     private var autoAppItem: NSMenuItem!
@@ -1010,7 +1042,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var installPanel: InstallPanel?
     private var installLogTimer: Timer?
 
-    /// 全局流程互斥锁：安装 dsh / 更新 dsh / 重启服务 三者互斥，
+    /// dsh 卸载流程状态
+    private var uninstallInProgress = false
+    private var uninstallPanel: InstallPanel?
+    private var uninstallLogTimer: Timer?
+
+    /// 全局流程互斥锁：安装 dsh / 更新 dsh / 卸载 dsh / 重启服务 四者互斥，
     /// 防止并发写 LaunchAgent plist 或并发 bootstrap/kickstart 导致服务状态错乱。
     private var operationLock = false
 
@@ -1121,6 +1158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installItem = NSMenuItem(title: "安装 dsh", action: #selector(installDsh), keyEquivalent: "")
         installItem.target = self
         menu.addItem(installItem)
+
+        uninstallItem = NSMenuItem(title: "卸载 dsh", action: #selector(uninstallDsh), keyEquivalent: "")
+        uninstallItem.target = self
+        menu.addItem(uninstallItem)
 
         restartItem = NSMenuItem(title: "重启服务", action: #selector(doRestart), keyEquivalent: "")
         restartItem.target = self
@@ -1363,6 +1404,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: 卸载 dsh
+
+    /// 菜单「卸载 dsh」（仅已安装时显示）：确认后先停止服务，再后台执行
+    /// `npm uninstall -g` 全局卸载，并清理 npx 缓存中的 dsh（否则 App 会因
+    /// 缓存命中误判为仍已安装）。
+    /// 两种模式由确认框选择：
+    /// · 仅卸载 —— 保留数据目录 ~/.dsh（会话历史、配置），重装后无缝恢复；
+    /// · 完全卸载 —— 连 ~/.dsh 与服务 LaunchAgent 配置（com.dsh.web.plist）
+    ///   一并删除，不留任何数据残留（不可恢复）。
+    @objc func uninstallDsh() {
+        // 卸载面板被最小化时先恢复显示（菜单栏 App 无 Dock 图标，靠菜单项找回）
+        if let panel = uninstallPanel, panel.isMiniaturized {
+            panel.deminiaturize(nil)
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
+        guard !uninstallInProgress, !operationLock else { return }
+        let node = resolveNodePath()
+        guard let npm = resolveNpmPath(nodePath: node) else {
+            showAlert(title: "无法卸载 dsh",
+                      message: "未找到 npm（Node.js 可能未安装），无法执行 npm uninstall。\n\n如需手动卸载：npm uninstall -g @deepseek-ai/dsh")
+            return
+        }
+        let localVersion = localDshVersion().map { "v\($0)" } ?? "未知版本"
+        let alert = NSAlert()
+        alert.messageText = "卸载 dsh？"
+        alert.informativeText = "将停止正在运行的 dsh web 服务，执行 npm uninstall -g @deepseek-ai/dsh（\(localVersion)），并清理 npx 缓存。\n\n"
+            + "· 仅卸载：保留数据目录 ~/.dsh（会话历史、配置），重装后无缝恢复\n"
+            + "· 完全卸载：连同 ~/.dsh 数据与服务 LaunchAgent 配置一并删除，不可恢复"
+        alert.addButton(withTitle: "仅卸载，保留 ~/.dsh")
+        alert.addButton(withTitle: "完全卸载，删除 ~/.dsh")
+        alert.buttons[1].hasDestructiveAction = true
+        alert.addButton(withTitle: "取消")
+        let choice = alert.runModal()
+        guard choice != .alertThirdButtonReturn else { return }
+        let fullWipe = (choice == .alertSecondButtonReturn)
+
+        uninstallInProgress = true
+        operationLock = true
+        refresh()
+
+        // 清空旧卸载日志，避免面板显示上一次的内容
+        try? "".write(to: uninstallLogFile, atomically: true, encoding: .utf8)
+
+        let panel = InstallPanel(panelTitle: fullWipe ? "完全卸载 dsh" : "卸载 dsh",
+                                 statusTitle: fullWipe ? "正在完全卸载 dsh…" : "正在卸载 dsh…",
+                                 statusText: "正在停止服务、卸载包并清理文件…",
+                                 doneTitle: fullWipe ? "dsh 已完全卸载" : "dsh 已卸载",
+                                 doneStatus: fullWipe
+                                     ? "服务与数据目录 ~/.dsh 已删除。"
+                                     : "服务已停止，数据目录 ~/.dsh 已保留。",
+                                 failTitle: "dsh 卸载失败")
+        uninstallPanel = panel
+        panel.center()
+        panel.orderFrontRegardless()
+        panel.makeKey()
+
+        let t = Timer(timeInterval: 1, target: self, selector: #selector(refreshUninstallLog), userInfo: nil, repeats: true)
+        RunLoop.main.add(t, forMode: .common)
+        uninstallLogTimer = t
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 1. 先停服务：App 托管的 launchd 任务 + 兜底结束端口上残留的 dsh 实例
+            stopService()
+            for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
+            killDshOnPort3080()
+            // 2. 全局卸载（timeout 120s 防卡死）；与安装一致使用完整终端环境，
+            //    保证 npm 及其子进程能拿到 node 工具链
+            var env = ProcessInfo.processInfo.environment
+            for (k, v) in serviceEnvironment(nodePath: node) {
+                env[k] = v
+            }
+            let code = runProcessLogging(node, [npm, "uninstall", "-g", "@deepseek-ai/dsh"],
+                                         timeout: 120, env: env, logURL: uninstallLogFile)
+            // 3. 收尾清理：npm 残留临时目录 + npx 缓存里的 dsh（保证回到「未安装」状态）
+            cleanDshStagingResidue()
+            removeNpxCachedDsh()
+            // 4. 完全卸载：删除数据目录 ~/.dsh 与服务 LaunchAgent 配置。
+            //    plist 此前已随 stopService() bootout，直接删文件即可；
+            //    重装时 startService() 会重新生成。
+            if fullWipe {
+                let dataDir = homeDir.appendingPathComponent(".dsh")
+                do {
+                    try fs.removeItem(at: dataDir)
+                    appendToUninstallLog("完全卸载：已删除数据目录 \(dataDir.path)")
+                } catch {
+                    if fs.fileExists(atPath: dataDir.path) {
+                        appendToUninstallLog("删除 \(dataDir.path) 失败：\(error.localizedDescription)")
+                    }
+                }
+                try? fs.removeItem(at: servicePlistURL)
+            }
+            DispatchQueue.main.async { self?.uninstallFinished(code: code) }
+        }
+    }
+
+    @objc func refreshUninstallLog() {
+        uninstallPanel?.updateLog(uninstallLogTail(30))
+    }
+
+    private func uninstallFinished(code: Int32) {
+        uninstallLogTimer?.invalidate()
+        uninstallLogTimer = nil
+        uninstallInProgress = false
+        operationLock = false
+        invalidateDshInfo()   // 卸载完成，安装状态已变化，清除缓存
+        latestRemoteVersion = nil
+        updateAvailable = false
+        updateIsPreview = false
+        refresh()
+
+        // 成功判定：退出码 0 且本地已检测不到 dsh（全局包与 npx 缓存都已清理）
+        if code == 0 && !dshInstalled() {
+            uninstallPanel?.setSuccess()
+            // 稍作停留展示“已卸载”，然后自动关闭面板；服务保持停止，
+            // 下次点「安装 dsh」即可重新走首次安装流程
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.uninstallPanel?.close()
+                self?.uninstallPanel = nil
+            }
+        } else {
+            let tail = uninstallLogTail(20)
+            let detail = dshInstalled() ? "\n本地仍检测到 dsh（全局包或 npx 缓存未清干净）。" : ""
+            uninstallPanel?.setFailure("卸载失败（退出码 \(code)）\(detail)\n\n\(tail)")
+        }
+    }
+
     // MARK: dsh 更新（自动检测 + 一键升级）
 
     /// 菜单「更新 dsh / 检查更新」：面板被最小化时先恢复显示
@@ -1578,6 +1747,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             installItem.isHidden = false
         } else {
             installItem.isHidden = true
+        }
+        // 「卸载 dsh」：仅已安装时显示；卸载中禁用并改名；安装/更新进行中隐藏（状态不稳定）
+        if uninstallInProgress {
+            uninstallItem.title = "dsh 卸载中…"
+            uninstallItem.isEnabled = false
+            uninstallItem.isHidden = false
+        } else if dshInstalled(), !installInProgress, !updatingInProgress {
+            uninstallItem.title = "卸载 dsh"
+            uninstallItem.isEnabled = true
+            uninstallItem.isHidden = false
+        } else {
+            uninstallItem.isHidden = true
         }
         // 服务未安装时重启/打开 UI 不可用
         restartItem.isEnabled = state != .notInstalled

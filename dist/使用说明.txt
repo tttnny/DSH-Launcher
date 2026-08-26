@@ -40,9 +40,12 @@ Web UI 是一个跑在本机上的服务（浏览器访问 http://127.0.0.1:3080
 ----------
 · 数据目录：~/.dsh/（会话历史、工作区注册表、API 凭据 .credentials.yaml）
 · 服务日志：~/Library/Logs/DSHLauncher/dsh-web.log
-· 卸载：菜单里没有卸载项，手动删除即可——
-  终端执行 `launchctl bootout gui/$(id -u)/com.dsh.web` 后
-  删除 ~/Library/LaunchAgents/com.dsh.web.plist 和 DSH Launcher.app
+· 卸载 dsh：点菜单「卸载 dsh」（仅已安装时显示），两种方式二选一——
+  · 仅卸载：保留 ~/.dsh 数据，之后可随时「安装 dsh」无缝恢复
+  · 完全卸载：连 ~/.dsh 数据与服务配置一并删除（不可恢复，请先备份会话记录）
+· 卸载本 App（不影响已装的 dsh）：退出 App 后，终端执行
+  `launchctl bootout gui/$(id -u)/com.dsh.menubar`，
+  再删除 ~/Library/LaunchAgents/com.dsh.menubar.plist 和 DSH Launcher.app
 
 常见问题
 --------
