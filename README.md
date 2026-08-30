@@ -2,21 +2,67 @@
 
 [English](README.en.md) | **中文**
 
-macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再需要开着终端**。
-**App 在 → 服务就在：启动 App 自动拉起服务，退出 App 自动停止服务。**
-点击菜单栏鲸鱼图标（🐋 绿=运行中 / 橙=端口被外部占用 / 红=启动失败 / 灰=未运行，图标为官方 dsh 鲸鱼 logo 按状态着色）弹出控制菜单，可打开 Web UI、重启服务、设置登录自启、打开数据目录或退出。
+macOS 菜单栏小应用 + 主窗口控制台：把 dsh 服务交给 launchd 托管，**不再需要开着终端**。
+
+**v2.0 起，服务全手动控制（契约变更）**：dsh 服务是独立的 launchd LaunchAgent（`com.dsh.web`）——
+
+- App 启动**不会**自动拉起服务；
+- 退出 App **不会**停止服务；
+- 服务崩溃**不会**自动重启（plist 无 KeepAlive）。
+
+一切启动/重启/关闭都在主窗口操作，菜单栏只保留最常用的三件事。
+点击菜单栏鲸鱼图标（🐋 绿=运行中 / 橙=端口被外部占用 / 红=异常退出 / 灰=未运行，官方 dsh 鲸鱼 logo 按状态着色）：**打开 Web**、**显示主窗口**、**退出 App**。
 > 绿色 = launchd 托管进程在运行 **且** HTTP 3080 实际可访问，双条件缺一不亮绿。
 服务进程继承你终端的 zsh 环境（PATH 等），agent 的 shell 工具直接可用 node/npm/pnpm/bun 等工具链。
 
-![DSH Launcher 菜单栏效果](docs/screenshot.png)
+![DSH 主窗口](docs/screenshot.png)
 
 ## 需要先手动执行 `npx @deepseek-ai/dsh web` 吗？
 
 **不需要。** 前提只是"机器上装有 Node.js"：
 
-- 本 App 负责启动并托管 `dsh web --port 3080`（App 启动自动拉起，也可点"重启服务"手动拉起）；已有 dsh（全局安装或 npx 缓存）直接复用。
-- 首次使用（本地无 dsh）时，App 不会自动下载，菜单栏显示"服务：dsh 未安装"并出现「安装 dsh」按钮。点击后弹出安装面板（实时显示下载日志），安装完成自动拉起服务，全程无需重启 App。
-- 如果你之前在终端手动跑过 `dsh web`，那个进程占着 3080 端口，App 会显示橙色"外部实例"——先在终端按 `Ctrl+C` 停掉，再让 App 接管（步骤见下文）。
+- 首次打开 App：本地没有 dsh 时会自动弹出主窗口引导安装。点「安装 dsh」（实时显示下载日志），装完点「启动」即可，全程无需终端。
+- 已有 dsh（全局安装或 npx 缓存）直接复用，无需重复安装。
+- 如果端口 3080 被终端里手动跑的 `dsh web` 占着，点「启动」时 App 会结束它并接管（无需 Ctrl+C）；占用者不是 dsh 时会先弹确认，绝不误杀。
+
+## 菜单栏（仅 3 项）
+
+| 菜单项 | 作用 |
+|---|---|
+| 打开 Web (⌘O) | 浏览器打开 http://127.0.0.1:3080（服务未运行时置灰，先去主窗口「启动」） |
+| 显示主窗口 | 打开/找回 DSH 控制台主窗口（关窗仅隐藏，可随时找回） |
+| 退出 App (⌘Q) | 仅退出本 App，**不影响 dsh 服务**（服务常驻 launchd） |
+
+## 主窗口（DSH 控制台）
+
+| 区块 | 内容 |
+|---|---|
+| dsh 信息 | 服务状态、本地版本、npm 最新版、GitHub Release 最新版（npm 未发布的版本会标注「npm 未发布」并可跳转 Release 页）、运行中的 Profile、安装位置、Node 路径、端口 |
+| 服务控制 | **启动 / 重启 / 关闭**；未安装时显示「安装 dsh」，已安装时显示「卸载 dsh」与「检查更新 / 更新 → vX」（安装、更新均有实时日志进度面板） |
+| Profile | 列出 `~/.dsh/profiles/` 下的 profile（含 package.json 的子目录），显示各 profile 的 bundles 插件列表；选中后点「启动」即以该 profile 运行；「打开目录」直达 profile 文件夹 |
+| 服务日志 | `~/Library/Logs/DSHLauncher/dsh-web.log` 尾部实时刷新，启动失败不用开终端排查 |
+| 设置 | 登录时自动启动本 App（只影响 App 自身，不影响服务）、打开 `~/.dsh` 数据目录、打开日志目录 |
+
+### 服务生命周期（v2.0 全手动）
+
+| 动作 | 行为 |
+|---|---|
+| 启动 | 以当前选中的 profile 启动服务（端口被外部 dsh 占用 → 结束接管；被其他程序占用 → 确认后结束；运行中切换 profile → 弹确认后重启） |
+| 重启 | 以当前 profile 停旧拉新，不弹确认 |
+| 关闭 | 停止服务（`launchctl bootout` + 兜底结束端口上的 dsh 进程），保持停止直到再次手动启动 |
+| 崩溃 | 状态红色「异常退出」，**不会自动重启**，需手动点「重启」 |
+| 退出 / 重开 App | 服务照常运行 / 不会自动拉起，一切以主窗口按钮为准 |
+| 更新 dsh | 更新前服务在跑 → 装完自动重启加载新版；更新前停着 → 保持停止 |
+
+### 关于 Profile
+
+dsh 的 profile 是「插件组合包按顺序叠加 + 个人覆盖层」的启动单元，位于 `~/.dsh/profiles/<name>`。
+App 启动时扫描该目录（含 package.json 的子目录，跳过 `node_modules`）；`web`/`headless` 由 dsh
+首次运行自动从模板初始化，其他 profile 需用 `dsh plugin --profile <name> ...` 创建（终端操作）。
+
+- 选中 profile 只影响下一次「启动 / 重启」；同一时刻只有一个 profile 占用 3080 端口，**切换 = 用新 profile 重启服务**。
+- 上次选中的 profile 会被记住；「运行 Profile」行显示当前实际运行（由本 App 启动）的 profile。
+- 启动命令即 `dsh --profile <name> --port 3080 --no-open`（`dsh web` 只是 `--profile web` 的别名）。
 
 ## 安装（DMG 发行版）
 
@@ -37,33 +83,13 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 ```
 
 产物为可直接运行的 `dist/DSH Launcher.app`，拷贝到任意位置（如 `~/Applications/`）即可使用。
-
-## 菜单功能
-
-| 菜单项 | 作用 |
-|---|---|
-| 状态行 | 服务是否运行（launchd 托管 / 外部实例占用 3080） |
-| 打开 Web UI (⌘O) | 浏览器打开 http://127.0.0.1:3080 |
-| 安装 dsh（仅未安装时显示） | 首次使用点击安装，弹窗实时显示下载进度，装完自动启动服务 |
-| 卸载 dsh（仅已安装时显示） | 确认后先停止服务，再执行 `npm uninstall -g @deepseek-ai/dsh` 并清理 npx 缓存。二选一：**仅卸载**（保留数据目录 `~/.dsh`，重装无缝恢复）或**完全卸载**（连 `~/.dsh` 数据与服务 LaunchAgent 配置一起删除，无残留、不可恢复） |
-| 重启服务 | 永远可用：运行中=重启；启动失败/未运行=直接启动；端口被外部实例占用=弹窗说明占用者 |
-| 更新 dsh / 检查更新 | 自动检测 npm 新版本（启动 10 秒后及每 6 小时各查一次，静默不弹窗）：发现新版本时菜单变为「更新 dsh → vX」，点击一键升级（`npm install -g @deepseek-ai/dsh@latest`），完成后自动重启服务；无更新时点此手动检查 |
-| dsh 版本：vX | 只读信息行，显示当前已安装的 dsh 版本（未安装时显示「未安装」） |
-| 登录时自动启动本 App | 登录后自动出现菜单栏图标并拉起服务 |
-| 打开数据目录 | `~/.dsh` |
-| 退出 | 退出 App **并停止服务**（`launchctl bootout`，数据已落盘，下次打开 App 即恢复） |
-
-## 从终端实例切换（第一次使用）
-
-现在端口 3080 可能还被终端里的 `dsh web` 占着（App 会显示橙色"外部实例"）。
-切换步骤：
-
-1. 在终端按 `Ctrl+C` 停掉旧的 `dsh web`（本次会话会离线，但历史记录都在 `~/.dsh/sessions/`）
-2. 退出再打开 DSH Launcher（或点 **重启服务**），服务自动拉起
-3. 状态变绿后点 **打开 Web UI**，历史会话完整可续
+源码结构：`Sources/main.swift`（launchd 托管、安装/更新、AppModel 状态模型）+
+`Sources/MainWindow.swift`（SwiftUI 主窗口）。
 
 ## 技术要点
 
+- **全手动生命周期**：服务 LaunchAgent（`com.dsh.web`）不带 `RunAtLoad`/`KeepAlive`——
+  不登录自启、不崩溃自愈，启停完全由主窗口控制；App 退出不销毁服务。
 - **环境继承**：launchd 本身没有你的 shell 配置，所以每次启动服务前，App 会用
   `zsh -lic` 抓取你的完整环境写入 plist 的 `EnvironmentVariables`（PATH 剔除易失的
   fnm multishell 临时目录、node 目录置顶）。服务进程与 agent 的 shell 工具因此
@@ -74,19 +100,21 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
   不要依赖 .zshrc 环境变量传给服务内的 agent。
 - **升级 dsh 无需改配置**：每次启动服务都会重新解析 node 与最新 dsh 包路径并
   重写 `~/Library/LaunchAgents/com.dsh.web.plist`。
-- **自动更新检测**：App 启动 10 秒后及每 6 小时查询一次 npm registry
-  （`@deepseek-ai/dsh` 的 `latest` + `next` 两个 dist-tag，取版本更高者），与本地
-  已装版本按 SemVer 2.0 比较（正确识别 rc/alpha/beta 预发布号）。发现新版本时菜单栏
-  出现「更新 dsh → vX」，来自 `next` 预发布通道的目标版本会标注「（预发布）」；
-  点击一键执行 `npm install -g @deepseek-ai/dsh@<目标版本>`（装确切版本，不写死
-  @latest），完成后自动重启服务加载新版。更新日志：
-  `~/Library/Logs/DSHLauncher/dsh-update.log`。
+- **双通道更新检测**：App 启动 10 秒后及每 6 小时各检查两个渠道（静默，不打扰）：
+  · **npm registry**（`@deepseek-ai/dsh` 的 `latest` + `next` 两个 dist-tag，取版本更高者）——
+  唯一可一键升级的渠道，与本地已装版本按 SemVer 2.0 比较（正确识别 rc/alpha/beta 预发布号），
+  发现新版本时主窗口出现「更新 → vX」按钮（来自 `next` 预发布通道的目标版本会标注「（预发布）」），
+  点击一键执行 `npm install -g @deepseek-ai/dsh@<目标版本>`（装确切版本，不写死 @latest）。
+  · **GitHub Releases**（deepseek-ai/deepseek-harness）——官方 release 偶有领先 npm 的预发布
+  （如 alpha 版，npm 上没有），信息区会显示「GitHub Release」最新版并标注「npm 未发布」，
+  附「查看 Release」跳转链接；该频道仅提示，不提供自动安装（release 无产物）。
+  更新日志：`~/Library/Logs/DSHLauncher/dsh-update.log`。
 - **日志轮转**：`dsh-web.log` 超过 20MB 时在下次重启服务前自动轮转为 `.1`，
   防止无限增长占满磁盘。
 
 ## 卸载 dsh
 
-不想继续用 dsh 了？菜单点 **「卸载 dsh」**（仅已安装时显示），确认框里二选一：
+不想继续用 dsh 了？主窗口点 **「卸载 dsh」**（仅已安装时显示），确认框里二选一：
 
 - **仅卸载，保留 ~/.dsh**：停止服务 → `npm uninstall -g @deepseek-ai/dsh`
   并清理 npx 缓存，回到「未安装」状态。数据目录 `~/.dsh`（会话历史、配置）原样
@@ -98,6 +126,8 @@ macOS 菜单栏小应用：把 `dsh web` 服务交给 launchd 托管，**不再�
 卸载日志：`~/Library/Logs/DSHLauncher/dsh-uninstall.log`。
 
 ## 卸载本 App
+
+服务是独立 LaunchAgent，卸载 App 前先在主窗口点「关闭」停止服务（或直接用下面的 bootout）：
 
 ```bash
 launchctl bootout gui/$(id -u)/com.dsh.web 2>/dev/null

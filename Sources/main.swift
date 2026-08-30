@@ -1,11 +1,18 @@
 import AppKit
+import Combine
 import Foundation
 import Darwin
 
 // ============================================================
 // DSH Launcher — DeepSeek Harness 菜单栏控制 App
-// 通过 launchd LaunchAgent 管理 dsh web 服务（com.dsh.web），
-// 以及本 App 的登录自启（com.dsh.menubar）。
+// 菜单栏只保留：打开 Web / 显示主窗口 / 退出 App；
+// 其余能力（dsh 信息、安装/卸载/更新、启动/重启/关闭服务、
+// profile 选择启动、日志、设置）全部在 SwiftUI 主窗口（MainWindow.swift）。
+//
+// 服务生命周期（v2.0 起）：dsh 服务是独立的 launchd LaunchAgent
+// （com.dsh.web），全手动控制——App 启动不自动拉起、退出不停服务、
+// 崩溃不自愈（plist 无 KeepAlive）。UI 状态由 AppModel 发布，
+// 菜单栏图标与主窗口共享。
 // ============================================================
 
 // MARK: - 小工具
@@ -252,10 +259,11 @@ let guiDomain = "gui/\(getuid())"
 let webURL = URL(string: "http://127.0.0.1:3080")!
 // 完整包元数据端点：含 dist-tags（latest / next 等），用于检测 dsh 更新
 let npmRegistryURL = URL(string: "https://registry.npmjs.org/@deepseek-ai/dsh")!
+// GitHub Releases：dsh 官方发布页。注意所有 dsh release 都是 prerelease（rc/alpha），
+// `releases/latest` 端点会排除 prerelease，因此拉列表取 tag 语义版本最高者。
+// 未认证配额 60 次/小时/IP，每次检查只用 1 个请求，足够。
+let githubReleasesURL = URL(string: "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=10")!
 let defaults = UserDefaults.standard
-
-/// 单实例守卫淘汰的重复实例：退出时不应触发“停止服务”
-var isDuplicateExit = false
 
 // MARK: - node / dsh web 路径解析
 // 用户的 node 来自 fnm（登录 shell 临时 shim，launchd 环境里没有），
@@ -604,6 +612,34 @@ func fetchLatestDshVersion(completion: @escaping (String?, Bool) -> Void) {
     }.resume()
 }
 
+/// 查询 GitHub Release 频道的最新版本（tag 形如 `dsh-v0.1.2-alpha.1`）。
+/// npm 上未发布的版本（如 alpha 预发布）只能在这里检测到；仅作信息展示，
+/// 不参与一键升级（GitHub release 无产物，装不了）。
+/// 返回 `(版本, release 页面 URL, 是否 prerelease)`；失败（网络/限流/解析）返回 nil。
+func fetchLatestGithubRelease(completion: @escaping (_ version: String?, _ url: String?, _ isPrerelease: Bool) -> Void) {
+    var req = URLRequest(url: githubReleasesURL)
+    req.timeoutInterval = 10
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    URLSession.shared.dataTask(with: req) { data, _, error in
+        guard error == nil, let data = data,
+              let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            completion(nil, nil, false)
+            return
+        }
+        var best: (version: String, url: String, pre: Bool)? = nil
+        for item in list {
+            guard let tag = item["tag_name"] as? String, tag.hasPrefix("dsh-v") else { continue }
+            let v = String(tag.dropFirst("dsh-v".count))
+            let url = item["html_url"] as? String ?? "https://github.com/deepseek-ai/deepseek-harness/releases"
+            let pre = item["prerelease"] as? Bool ?? true
+            if best == nil || isNewerVersion(v, than: best!.version) {
+                best = (v, url, pre)
+            }
+        }
+        completion(best?.version, best?.url, best?.pre ?? false)
+    }.resume()
+}
+
 /// 服务状态判定。核心原则：只看 3080 端口上跑的是不是 dsh，不关心谁在托管。
 /// - 端口上是 dsh → 绿色（无论 App 托管 / 终端手动 / 孤儿进程，本质同一个服务）
 /// - 端口被非 dsh 程序占用 → 橙色（dsh 真的不可用）
@@ -724,12 +760,14 @@ func serviceEnvironment(nodePath: String) -> [String: String] {
     return env
 }
 
-/// 生成服务的完整启动命令。
-/// 优先直接跑缓存的 dsh bin.js；没有缓存时退回 `npx --yes @deepseek-ai/dsh`
-/// （首次会联网下载，之后就有缓存了），保证朋友的机器开箱即用。
+/// 生成服务的完整启动命令：以 `--profile <name>` 启动 ~/.dsh/profiles/<name>
+/// （`dsh web` 只是 `--profile web` 的别名）。优先直接跑缓存的 dsh bin.js；
+/// 没有缓存时退回 `npx --yes @deepseek-ai/dsh`（首次会联网下载，之后就有缓存了），
+/// 保证朋友的机器开箱即用。
 /// 注意：dsh 只允许绑定 127.0.0.1（官方禁止 `--host 0.0.0.0`），
 /// 局域网访问请安装社区插件 moxisuki/dsh-lan，与本 App 无关。
-func buildProgram() -> [String]? {
+/// 启动器的 flag 必须写在最前面，其后的 `--port`/`--no-open` 属于 web 应用。
+func buildProgram(profile: String) -> [String]? {
     let node = resolveNodePath()
     var base: [String]
     if let dsh = resolveDshLauncher(nodePath: node) {
@@ -739,9 +777,9 @@ func buildProgram() -> [String]? {
     } else {
         return nil
     }
-    // --no-open：服务由本 App 托管/自愈拉起时不应每次弹浏览器；
-    // 需要打开 UI 时用户直接点菜单栏「打开 Web UI」。
-    return base + ["web", "--port", "3080", "--no-open"]
+    // --no-open：服务由 launchd 托管拉起时不应每次弹浏览器；
+    // 需要打开 UI 时用户直接点菜单栏「打开 Web」。
+    return base + ["--profile", profile, "--port", "3080", "--no-open"]
 }
 
 func servicePlistXML(program: [String], workspace: String, env: [String: String]) -> String {
@@ -765,10 +803,6 @@ func servicePlistXML(program: [String], workspace: String, env: [String: String]
     \(envXML)
       </dict>
       <key>RunAtLoad</key><false/>
-      <key>KeepAlive</key>
-      <dict>
-        <key>SuccessfulExit</key><false/>
-      </dict>
       <key>ThrottleInterval</key><integer>10</integer>
       <key>StandardOutPath</key><string>\(escapeXml(logFile.path))</string>
       <key>StandardErrorPath</key><string>\(escapeXml(logFile.path))</string>
@@ -869,13 +903,16 @@ func applyToolCordisPatchIfNeeded() -> Bool {
     }
 }
 
-func startService() -> Bool {
+/// 以指定 profile 启动服务：重写 LaunchAgent plist（无 KeepAlive，崩溃不自愈）
+/// 并 bootstrap + kickstart。RunAtLoad 恒为 false（服务全手动控制），
+/// bootstrap 只注册不启动，需 kickstart 手动拉起。
+func startService(profile: String) -> Bool {
     // 适配创造模式：每次启动/重启服务前检查并应用 dsh-tool-cordis 幂等补丁
     // （dsh 升级覆盖 node_modules 后自动重打，保证 cordis / ptc-cordis 多预设共存）
     if applyToolCordisPatchIfNeeded() {
         appendToServiceLog("已应用 dsh-tool-cordis 幂等补丁（适配创造模式多预设共存）")
     }
-    guard let program = buildProgram() else { return false }
+    guard let program = buildProgram(profile: profile) else { return false }
     try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
     // 轮转服务日志（launchd 的 StandardOutPath 无限增长，防止磁盘被日志占满）
     rotateLogIfNeeded(logFile)
@@ -892,7 +929,6 @@ func startService() -> Bool {
         if code != 0 { return false }
     }
     if !serviceRunning() {
-        // RunAtLoad 恒为 false（不做登录自启），bootstrap 只注册不启动，需 kickstart 手动拉起
         let (code, _) = launchctl(["kickstart", "\(guiDomain)/\(serviceLabel)"])
         if code != 0 { return false }
     }
@@ -1012,213 +1048,162 @@ final class InstallPanel: NSPanel {
     }
 }
 
-// MARK: - App 主体
+// MARK: - dsh profile（~/.dsh/profiles）
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem!
-    private var timer: Timer?          // 5 秒状态刷新
-    private var updateTimer: Timer?    // 6 小时自动检查更新
+/// 一个 dsh profile：~/.dsh/profiles/<name> 目录，package.json 的
+/// `dsh.profile.bundles` 声明它叠加的插件组合包（顺序即叠加顺序）。
+struct DshProfile: Identifiable, Hashable {
+    let name: String
+    let dir: String
+    let bundles: [String]
+    var id: String { name }
+}
 
-    private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    private var openItem: NSMenuItem!
-    private var restartItem: NSMenuItem!
-    private var installItem: NSMenuItem!
-    private var uninstallItem: NSMenuItem!
-    private var updateItem: NSMenuItem!
-    private var versionItem: NSMenuItem!
-    private var autoAppItem: NSMenuItem!
-
-    /// dsh 更新检测/升级流程状态
-    private var latestRemoteVersion: String?      // npm 最新版本
-    private var updateAvailable = false           // 是否存在可升级的新版本
-    private var updateIsPreview = false           // 目标版本是否来自 next 预发布通道
-    private var checkingUpdates = false           // 正在查询 npm registry
-    private var updatingInProgress = false        // 正在执行 npm 升级
-    private var updatePanel: InstallPanel?
-    private var updateLogTimer: Timer?
-
-    /// dsh 安装流程状态
-    private var installInProgress = false
-    private var installPanel: InstallPanel?
-    private var installLogTimer: Timer?
-
-    /// dsh 卸载流程状态
-    private var uninstallInProgress = false
-    private var uninstallPanel: InstallPanel?
-    private var uninstallLogTimer: Timer?
-
-    /// 全局流程互斥锁：安装 dsh / 更新 dsh / 卸载 dsh / 重启服务 四者互斥，
-    /// 防止并发写 LaunchAgent plist 或并发 bootstrap/kickstart 导致服务状态错乱。
-    private var operationLock = false
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // 单实例守卫：菜单栏 App 重复打开会出现多个图标，保留最早的那个。
-        // 不能用 bundle id 查询（launchd 直启的进程可能无法关联 bundle），
-        // 改为按“可执行文件路径相同”匹配所有运行中的应用。
-        let myExe = Bundle.main.executableURL?.standardizedFileURL.path
-        let myBundleId = Bundle.main.bundleIdentifier
-        let dupes = NSWorkspace.shared.runningApplications.filter {
-            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier &&
-            (($0.bundleIdentifier != nil && $0.bundleIdentifier == myBundleId) ||
-             $0.executableURL?.standardizedFileURL.path == myExe)
-        }
-        if !dupes.isEmpty {
-            let earliest = dupes.min { ($0.launchDate ?? .distantPast) < ($1.launchDate ?? .distantPast) }
-            if let earliest, (earliest.launchDate ?? .distantPast) < (NSRunningApplication.current.launchDate ?? .distantPast) {
-                isDuplicateExit = true // 被淘汰的实例退出时不要停止服务
-                NSApp.terminate(nil)
-                return
+/// 扫描 ~/.dsh/profiles 下含 package.json 的子目录（跳过 dotfiles 与
+/// 共享 node_modules）。目录不存在或为空时兜底返回「web」——dsh 首次以
+/// `--profile web` 启动时会自动从随包模板初始化该 profile。
+func scanDshProfiles() -> [DshProfile] {
+    let root = homeDir.appendingPathComponent(".dsh/profiles", isDirectory: true)
+    var out: [DshProfile] = []
+    if let entries = try? fs.contentsOfDirectory(atPath: root.path) {
+        for e in entries.sorted() {
+            guard !e.hasPrefix("."), e != "node_modules" else { continue }
+            let dir = root.appendingPathComponent(e, isDirectory: true)
+            var isDir: ObjCBool = false
+            guard fs.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue,
+                  fs.fileExists(atPath: dir.appendingPathComponent("package.json").path) else { continue }
+            var bundles: [String] = []
+            if let data = fs.contents(atPath: dir.appendingPathComponent("package.json").path),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let dsh = obj["dsh"] as? [String: Any],
+               let profile = dsh["profile"] as? [String: Any],
+               let list = profile["bundles"] as? [String] {
+                bundles = list
             }
+            out.append(DshProfile(name: e, dir: dir.path, bundles: bundles))
         }
-        NSApp.setActivationPolicy(.accessory)
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        updateDot(serviceState())
-        buildMenu()
-        // 生命周期绑定：App 在 → 服务在，启动即自动拉起服务；
-        // 先启动（内部立即刷新为“正在启动”），避免闪一帧“未运行”
-        autoStartService()
-        refresh()
+    }
+    if out.isEmpty {
+        out = [DshProfile(name: "web", dir: root.appendingPathComponent("web").path,
+                          bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"])]
+    }
+    return out
+}
+
+// MARK: - App 状态模型（菜单栏图标与主窗口共享）
+
+/// 全部 UI 状态与操作入口。菜单栏 AppDelegate 与 SwiftUI 主窗口都观察它。
+/// 服务生命周期契约（v2.0）：全手动——App 启动不自动拉起服务、退出不停服务、
+/// 崩溃不自愈（plist 无 KeepAlive），一切启停由用户在主窗口操作。
+final class AppModel: NSObject, ObservableObject {
+    static let shared = AppModel()
+
+    // 服务与 dsh 状态（5 秒定时刷新 + 操作后即时刷新）
+    @Published var state: ServiceState = .stopped
+    @Published var envNote = ""
+    @Published var localVersion: String?
+    @Published var autoAppOn = false
+
+    // profile
+    @Published var profiles: [DshProfile] = []
+    @Published var selectedProfile: String
+    /// 最近一次由本 App 成功启动的 profile（持久化；服务独立于 App 存活，
+    /// App 重开后据此展示"当前运行的是哪个 profile"，尽力追踪）
+    @Published var runningProfile: String? = nil
+
+    // dsh 更新（npm 频道：唯一可一键升级的渠道）
+    @Published var latestRemoteVersion: String?
+    @Published var updateAvailable = false
+    @Published var updateIsPreview = false
+    @Published var checkingUpdates = false
+    @Published var updatingInProgress = false
+    /// npm registry 上实际最新版本（不区分是否比本地新，供信息区展示）
+    @Published var npmLatestVersion: String?
+
+    // dsh 更新（GitHub Release 频道：仅信息展示 + 跳转，npm 未发布的版本装不了）
+    @Published var githubLatestVersion: String?
+    @Published var githubReleaseURL: String?
+    @Published var githubIsPrerelease = false
+    @Published var checkingGithub = false
+
+    // 长流程互斥与进行中标志（驱动按钮禁用/改名）：安装/卸载/更新/重启/停止互斥
+    @Published var busy = false
+    @Published var installInProgress = false
+    @Published var uninstallInProgress = false
+
+    // 服务日志尾部（主窗口日志区，1 秒流式刷新）
+    @Published var logText = ""
+
+    private var refreshTimer: Timer?
+    private var updateTimer: Timer?
+    private var installLogTimer: Timer?
+    private var updateLogTimer: Timer?
+    private var uninstallLogTimer: Timer?
+    private var logStreamTimer: Timer?
+
+    private(set) var installPanel: InstallPanel?
+    private(set) var updatePanel: InstallPanel?
+    private(set) var uninstallPanel: InstallPanel?
+
+    override private init() {
+        let saved = defaults.string(forKey: "selectedProfile")
+        selectedProfile = saved ?? "web"
+        super.init()
+        runningProfile = defaults.string(forKey: "runningProfile")
+    }
+
+    /// 定时器：5 秒状态刷新 + 6 小时静默检查更新
+    func startTimers() {
         let t = Timer(timeInterval: 5, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
         RunLoop.main.add(t, forMode: .common)
-        timer = t
-        // 自动检查 dsh 更新：启动 10 秒后查一次，之后每 6 小时自动查一次（静默，不打扰）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            self?.checkForUpdates(notifyIfUpToDate: false)
+        refreshTimer = t
+        let u = Timer(timeInterval: 6 * 3600, target: self, selector: #selector(autoCheckUpdates), userInfo: nil, repeats: true)
+        RunLoop.main.add(u, forMode: .common)
+        updateTimer = u
+    }
+
+    @objc func refresh() {
+        state = serviceState()
+        envNote = lastEnvCaptureFailed ? "⚠ shell 环境抓取失败，服务内工具链（node/npm 等）可能不可用" : ""
+        localVersion = localDshVersion()
+        profiles = scanDshProfiles()
+        if !profiles.contains(where: { $0.name == selectedProfile }) {
+            selectProfile(profiles[0].name)
         }
-        updateTimer = Timer(timeInterval: 6 * 3600, target: self,
-                            selector: #selector(autoCheckUpdates), userInfo: nil, repeats: true)
-        RunLoop.main.add(updateTimer!, forMode: .common)
+        autoAppOn = appAutoStartEnabled()
     }
 
-    private var whaleIconCache: [ServiceState: NSImage] = [:]
-
-    /// 按状态缓存着色的鲸鱼图标（避免每 5 秒重新渲染位图）。
-    func cachedWhaleIcon(_ state: ServiceState) -> NSImage? {
-        if let img = whaleIconCache[state] { return img }
-        let color: NSColor = {
-            switch state {
-            case .running: return .systemGreen
-            case .starting, .installing, .notInstalled: return .systemGray
-            case .portBusy: return .systemOrange
-            case .crashed: return .systemRed
-            case .stopped: return .systemGray
-            }
-        }()
-        guard let img = whaleMenuImage(color: color) else { return nil }
-        whaleIconCache[state] = img
-        return img
+    func selectProfile(_ name: String) {
+        selectedProfile = name
+        defaults.set(name, forKey: "selectedProfile")
     }
 
-    func updateDot(_ state: ServiceState) {
-        guard let button = statusItem.button else { return }
-        // dsh 鲸鱼图标按状态着色（缓存复用，不重复渲染）
-        if let image = cachedWhaleIcon(state) {
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.attributedTitle = NSAttributedString(string: "")
-        } else {
-            // 兜底：图标资源缺失时退回旧圆点
-            let (char, color): (String, NSColor) = {
-                switch state {
-                case .running: return ("●", .systemGreen)
-                case .starting, .installing, .notInstalled: return ("◌", .systemGray)
-                case .portBusy: return ("◍", .systemOrange)
-                case .crashed: return ("✕", .systemRed)
-                case .stopped: return ("○", .systemGray)
-                }
-            }()
-            button.attributedTitle = NSAttributedString(string: char, attributes: [
-                .font: NSFont.systemFont(ofSize: 12),
-                .foregroundColor: color
-            ])
-        }
+    // MARK: 打开入口
+
+    func openWeb() { NSWorkspace.shared.open(webURL) }
+    func openDataDir() { NSWorkspace.shared.open(homeDir.appendingPathComponent(".dsh")) }
+    func openLogDir() {
+        try? fs.createDirectory(at: logDir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(logDir)
+    }
+    func openProfileDir(_ profile: DshProfile) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: profile.dir))
     }
 
-    func buildMenu() {
-        let menu = NSMenu()
+    // MARK: 启动 / 重启 / 停止
 
-        let header = NSMenuItem(title: "DSH Launcher", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
+    /// 「启动」：确保服务以当前选中 profile 运行。
+    /// 端口被外部 dsh 占用 → 结束并接管；被其他程序占用 → 确认后结束；
+    /// 服务运行中且切换了 profile → 确认后重启。
+    func startRequested() { launchFlow(confirmSwitch: true) }
 
-        // 当前 dsh 版本（只读信息行，紧跟在标题下方）
-        versionItem = NSMenuItem(title: "dsh 版本：-", action: nil, keyEquivalent: "")
-        versionItem.isEnabled = false
-        menu.addItem(versionItem)
+    /// 「重启」：以当前选中 profile 停旧拉新，不弹确认。
+    func restartRequested() { launchFlow(confirmSwitch: false) }
 
-        statusLine.isEnabled = false
-        menu.addItem(statusLine)
-
-        menu.addItem(.separator())
-
-        openItem = NSMenuItem(title: "打开 Web UI", action: #selector(openUI), keyEquivalent: "o")
-        openItem.target = self
-        menu.addItem(openItem)
-
-        installItem = NSMenuItem(title: "安装 dsh", action: #selector(installDsh), keyEquivalent: "")
-        installItem.target = self
-        menu.addItem(installItem)
-
-        uninstallItem = NSMenuItem(title: "卸载 dsh", action: #selector(uninstallDsh), keyEquivalent: "")
-        uninstallItem.target = self
-        menu.addItem(uninstallItem)
-
-        restartItem = NSMenuItem(title: "重启服务", action: #selector(doRestart), keyEquivalent: "")
-        restartItem.target = self
-        menu.addItem(restartItem)
-
-        updateItem = NSMenuItem(title: "检查更新", action: #selector(checkUpdateTapped), keyEquivalent: "")
-        updateItem.target = self
-        menu.addItem(updateItem)
-
-        menu.addItem(.separator())
-
-        autoAppItem = NSMenuItem(title: "登录时自动启动本 App", action: #selector(toggleAutoApp(_:)), keyEquivalent: "")
-        autoAppItem.target = self
-        menu.addItem(autoAppItem)
-
-        menu.addItem(.separator())
-
-        let dataItem = NSMenuItem(title: "打开数据目录 ~/.dsh", action: #selector(showDataDir), keyEquivalent: "")
-        dataItem.target = self
-        menu.addItem(dataItem)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "退出（同时停止服务）", action: #selector(quitApp), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
-    }
-
-    // MARK: 动作
-
-    /// App 启动时自动拉起服务（生命周期绑定：App 在 → 服务在，App 退出 → 服务停止）。
-    /// 端口被外部实例占用时不弹窗打扰（状态行显示橙色即可）；
-    /// dsh 未安装时不自动下载，等待用户点击「安装 dsh」。
-    func autoStartService() {
-        if !dshInstalled() {
-            refresh()
-            return
-        }
-        if serviceRunning() || portServing() { return }
-        isStarting = true
-        refresh()
-        launchService()
-    }
-
-    @objc func openUI() {
-        NSWorkspace.shared.open(webURL)
-    }
-
-    /// 统一的启动/重启流程：先处理端口占用（dsh 实例直接结束接管、其他程序确认后结束），
-    /// 再停掉旧实例（幂等）、拉起并做轮询健康检查。
-    /// 运行中 → 停止后重新拉起；启动失败/未运行 → 直接启动。
-    func launchService() {
-        if !dshInstalled() {
+    private func launchFlow(confirmSwitch: Bool) {
+        guard dshInstalled() else {
             showAlert(title: "dsh 未安装",
-                      message: "请先点击菜单栏「安装 dsh」完成安装，再启动服务。")
+                      message: "请先完成「安装 dsh」，再启动服务。")
             refresh()
             return
         }
@@ -1229,15 +1214,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     performRestart()
                 } else {
                     showAlert(title: "无法结束占用进程",
-                              message: "占用者：\(port3080Occupier())\n\n无法自动结束该进程，请手动处理后再点“重启服务”。")
+                              message: "占用者：\(port3080Occupier())\n\n无法自动结束该进程，请手动处理后再试。")
                     refresh()
                 }
             } else {
                 // 非 dsh 程序占用：确认后再结束，避免误杀其他工作
                 let alert = NSAlert()
                 alert.messageText = "端口 3080 被其他程序占用"
-                alert.informativeText = "占用者：\(port3080Occupier())\n\n是否结束该进程并重启 dsh 服务？"
-                alert.addButton(withTitle: "结束并重启")
+                alert.informativeText = "占用者：\(port3080Occupier())\n\n是否结束该进程并启动 dsh 服务？"
+                alert.addButton(withTitle: "结束并启动")
                 alert.addButton(withTitle: "取消")
                 if alert.runModal() == .alertFirstButtonReturn {
                     if killPort3080() {
@@ -1251,27 +1236,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        if confirmSwitch, serviceRunning(), let running = runningProfile, running != selectedProfile {
+            let alert = NSAlert()
+            alert.messageText = "切换 profile 并重启服务？"
+            alert.informativeText = "服务正在以「\(running)」运行，将切换为「\(selectedProfile)」并重启。"
+            alert.addButton(withTitle: "切换并重启")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() != .alertFirstButtonReturn { return }
+        }
         performRestart()
     }
 
-    /// 实际执行重启：停旧实例 + 兜底杀端口（幂等），再拉起并轮询健康检查。
+    /// 实际执行重启：停旧实例 + 兜底杀端口（幂等），再以选中 profile 拉起并轮询健康检查。
     /// 整个流程在后台队列执行：startService 里的 `zsh -lic` 抓环境最多可等 8 秒，
     /// 健康检查每秒 curl 一次，绝不能阻塞主线程（菜单栏 App 会假死）。
-    func performRestart() {
-        guard !operationLock else { return } // 安装/更新/重启互斥
-        operationLock = true
+    private func performRestart() {
+        guard !busy else { return } // 安装/更新/卸载/重启互斥
+        busy = true
         isStarting = true
-        // 无本地 dsh 缓存说明是首次使用，需要 npx 联网下载 → 显示“dsh 安装中”
-        isInstallingDsh = !dshInstalled()
         refresh()
+        let profile = selectedProfile
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            stopService()   // 幂等：停 launchd 任务（App 托管时）
-            killPort3080()  // 兜底：无论谁占 3080，重启前都释放端口
+            stopService()   // 幂等：停 launchd 任务
+            killPort3080()  // 兜底：无论谁占 3080，启动前都释放端口
             var attempts = 0
             while true {
                 attempts += 1
-                if startService() { break }
+                if startService(profile: profile) { break }
                 if attempts >= 6 {
                     DispatchQueue.main.async {
                         self.finishStartup(ok: false, message: "无法写入 LaunchAgent 或启动服务（已重试 6 次）。\n\n日志尾部：\n\(logTail())")
@@ -1280,23 +1272,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 Thread.sleep(forTimeInterval: 0.5)
             }
-            // 复用 isInstallingDsh：无本地 dsh 缓存 → 首次联网下载，放宽健康检查窗口
-            let hasCache = !isInstallingDsh
-            let window: TimeInterval = hasCache ? 8 : 120
-            self.healthCheck(timeout: window) { ok in
+            self.healthCheck(timeout: 8) { ok in
                 DispatchQueue.main.async {
-                    self.finishStartup(ok: ok, message: ok ? nil :
-                        "服务未能启动\(hasCache ? "。" : "，首次使用需联网下载 dsh，请确认网络可用。")\n\n日志尾部：\n\(logTail())")
+                    if ok {
+                        self.runningProfile = profile
+                        defaults.set(profile, forKey: "runningProfile")
+                    }
+                    self.finishStartup(ok: ok, message: ok ? nil : "服务未能启动。\n\n日志尾部：\n\(logTail())")
                 }
             }
         }
     }
 
-    /// 结束“正在启动/安装中”状态：失败时弹日志尾部，随后刷新 UI。
-    func finishStartup(ok: Bool, message: String?) {
+    /// 结束"正在启动"状态：失败时弹日志尾部，随后刷新 UI。
+    private func finishStartup(ok: Bool, message: String?) {
         isStarting = false
-        isInstallingDsh = false
-        operationLock = false
+        busy = false
         if !ok, let message = message {
             showAlert(title: "服务启动失败", message: message)
         }
@@ -1304,8 +1295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 后台轮询健康检查：每秒探测一次 HTTP 3080，直到可用或超时。
-    /// 探测（curl）在后台线程执行，完成回调回主线程。
-    func healthCheck(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
+    private func healthCheck(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let deadline = Date().addingTimeInterval(timeout)
             while !portServing() && Date() < deadline {
@@ -1316,24 +1306,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func doRestart() {
-        launchService()
+    /// 「关闭」：bootout 停掉 launchd 任务，再兜底结束端口上的 dsh 进程
+    /// （只杀 dsh，绝不碰其他程序）。崩溃不自愈：关闭后保持停止，直到手动启动。
+    func stopRequested() {
+        guard !busy else { return }
+        busy = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            stopService()
+            for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
+            killDshOnPort3080()
+            DispatchQueue.main.async {
+                self?.runningProfile = nil
+                defaults.removeObject(forKey: "runningProfile")
+                self?.busy = false
+                self?.refresh()
+            }
+        }
     }
 
     // MARK: 安装 dsh（首次使用）
 
-    /// 菜单「安装 dsh」：弹进度面板，后台执行 `npm install -g` 全局安装，
-    /// 完成后自动拉起服务（无需重启 App）。与官方全局安装方式一致，
-    /// 安装后 `which dsh` 可找到，App 的 resolveDshLauncher 也会优先复用全局版。
-    @objc func installDsh() {
-        // 安装面板被最小化时先恢复显示（菜单栏 App 无 Dock 图标，靠菜单项找回）
+    /// 「安装 dsh」：弹进度面板，后台执行 `npm install -g` 全局安装。
+    /// v2.0 服务全手动：完成后不自动启动，由用户点「启动」。
+    func installRequested() {
+        // 安装面板被最小化时先恢复显示（菜单栏 App 无 Dock 图标，靠按钮找回）
         if let panel = installPanel, panel.isMiniaturized {
             panel.deminiaturize(nil)
             panel.orderFrontRegardless()
             panel.makeKey()
             return
         }
-        guard !installInProgress, !operationLock else { return }
+        guard !installInProgress, !busy else { return }
         let node = resolveNodePath()
         guard let npm = resolveNpmPath(nodePath: node) else {
             showAlert(title: "无法安装 dsh",
@@ -1341,14 +1344,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         installInProgress = true
-        operationLock = true
+        busy = true
         isInstallingDsh = true
         refresh()
 
         // 清空旧安装日志，避免面板显示上一次的内容
         try? "".write(to: installLogFile, atomically: true, encoding: .utf8)
 
-        let panel = InstallPanel()
+        let panel = InstallPanel(panelTitle: "安装 dsh",
+                                 statusTitle: "正在安装 dsh…",
+                                 statusText: "首次安装需联网下载，请稍候…",
+                                 doneTitle: "dsh 安装完成",
+                                 doneStatus: "可在主窗口点击「启动」运行服务",
+                                 failTitle: "dsh 安装失败")
         installPanel = panel
         panel.center()
         // orderFrontRegardless 强制置顶显示（不依赖激活状态）；
@@ -1361,8 +1369,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installLogTimer = t
 
         // 后台执行全局安装（timeout 180s 防卡死）。
-        // 关键：使用完整终端环境（以 App 当前环境为底，叠加 zsh 抓取的完整环境），
-        // 保证依赖 native 编译（make/clang/python）的包能和服务运行时一样正常安装。
+        // 使用完整终端环境（以 App 当前环境为底，叠加 zsh 抓取的完整环境），
+        // 保证依赖 native 编译（make/clang/python）的包能正常安装。
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // 先清理 @deepseek-ai 目录下的 npm 残留（如 .dsh-xxxxxx 临时目录），
             // 避免残留文件数超过 npm 安全删除阈值导致 install 被拒绝
@@ -1377,7 +1385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func refreshInstallLog() {
+    @objc private func refreshInstallLog() {
         installPanel?.updateLog(installLogTail(30))
     }
 
@@ -1385,53 +1393,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installLogTimer?.invalidate()
         installLogTimer = nil
         installInProgress = false
-        operationLock = false
+        busy = false
         isInstallingDsh = false
         invalidateDshInfo() // 安装完成，dsh 版本/状态已变化，清除缓存
         refresh()
 
         if code == 0 && dshInstalled() {
             installPanel?.setSuccess()
-            // 稍作停留展示“安装完成”，然后自动关闭面板并拉起服务
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            // 稍作停留展示"安装完成"，然后自动关闭面板（不自动启动服务）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.installPanel?.close()
                 self?.installPanel = nil
-                self?.launchService()
             }
         } else {
-            let tail = installLogTail(20)
-            installPanel?.setFailure("安装失败（退出码 \(code)），请检查网络后重试。\n\n\(tail)")
+            let tailText = installLogTail(20)
+            installPanel?.setFailure("安装失败（退出码 \(code)），请检查网络后重试。\n\n\(tailText)")
         }
     }
 
     // MARK: 卸载 dsh
 
-    /// 菜单「卸载 dsh」（仅已安装时显示）：确认后先停止服务，再后台执行
+    /// 「卸载 dsh」（仅已安装时可用）：确认后先停止服务，再后台执行
     /// `npm uninstall -g` 全局卸载，并清理 npx 缓存中的 dsh（否则 App 会因
-    /// 缓存命中误判为仍已安装）。
-    /// 两种模式由确认框选择：
-    /// · 仅卸载 —— 保留数据目录 ~/.dsh（会话历史、配置），重装后无缝恢复；
-    /// · 完全卸载 —— 连 ~/.dsh 与服务 LaunchAgent 配置（com.dsh.web.plist）
-    ///   一并删除，不留任何数据残留（不可恢复）。
-    @objc func uninstallDsh() {
-        // 卸载面板被最小化时先恢复显示（菜单栏 App 无 Dock 图标，靠菜单项找回）
+    /// 缓存命中误判为仍已安装）。两种模式由确认框选择：
+    /// · 仅卸载 —— 保留数据目录 ~/.dsh，重装后无缝恢复；
+    /// · 完全卸载 —— 连 ~/.dsh 与服务 LaunchAgent 配置一并删除（不可恢复）。
+    func uninstallRequested() {
         if let panel = uninstallPanel, panel.isMiniaturized {
             panel.deminiaturize(nil)
             panel.orderFrontRegardless()
             panel.makeKey()
             return
         }
-        guard !uninstallInProgress, !operationLock else { return }
+        guard !uninstallInProgress, !busy else { return }
         let node = resolveNodePath()
         guard let npm = resolveNpmPath(nodePath: node) else {
             showAlert(title: "无法卸载 dsh",
                       message: "未找到 npm（Node.js 可能未安装），无法执行 npm uninstall。\n\n如需手动卸载：npm uninstall -g @deepseek-ai/dsh")
             return
         }
-        let localVersion = localDshVersion().map { "v\($0)" } ?? "未知版本"
+        let ver = localDshVersion().map { "v\($0)" } ?? "未知版本"
         let alert = NSAlert()
         alert.messageText = "卸载 dsh？"
-        alert.informativeText = "将停止正在运行的 dsh web 服务，执行 npm uninstall -g @deepseek-ai/dsh（\(localVersion)），并清理 npx 缓存。\n\n"
+        alert.informativeText = "将停止正在运行的 dsh web 服务，执行 npm uninstall -g @deepseek-ai/dsh（\(ver)），并清理 npx 缓存。\n\n"
             + "· 仅卸载：保留数据目录 ~/.dsh（会话历史、配置），重装后无缝恢复\n"
             + "· 完全卸载：连同 ~/.dsh 数据与服务 LaunchAgent 配置一并删除，不可恢复"
         alert.addButton(withTitle: "仅卸载，保留 ~/.dsh")
@@ -1443,10 +1447,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fullWipe = (choice == .alertSecondButtonReturn)
 
         uninstallInProgress = true
-        operationLock = true
+        busy = true
         refresh()
 
-        // 清空旧卸载日志，避免面板显示上一次的内容
         try? "".write(to: uninstallLogFile, atomically: true, encoding: .utf8)
 
         let panel = InstallPanel(panelTitle: fullWipe ? "完全卸载 dsh" : "卸载 dsh",
@@ -1467,12 +1470,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uninstallLogTimer = t
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // 1. 先停服务：App 托管的 launchd 任务 + 兜底结束端口上残留的 dsh 实例
+            // 1. 先停服务：launchd 任务 + 兜底结束端口上残留的 dsh 实例
             stopService()
             for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
             killDshOnPort3080()
-            // 2. 全局卸载（timeout 120s 防卡死）；与安装一致使用完整终端环境，
-            //    保证 npm 及其子进程能拿到 node 工具链
+            // 2. 全局卸载（timeout 120s 防卡死）；使用完整终端环境
             var env = ProcessInfo.processInfo.environment
             for (k, v) in serviceEnvironment(nodePath: node) {
                 env[k] = v
@@ -1482,9 +1484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 3. 收尾清理：npm 残留临时目录 + npx 缓存里的 dsh（保证回到「未安装」状态）
             cleanDshStagingResidue()
             removeNpxCachedDsh()
-            // 4. 完全卸载：删除数据目录 ~/.dsh 与服务 LaunchAgent 配置。
-            //    plist 此前已随 stopService() bootout，直接删文件即可；
-            //    重装时 startService() 会重新生成。
+            // 4. 完全卸载：删除数据目录 ~/.dsh 与服务 LaunchAgent 配置
             if fullWipe {
                 let dataDir = homeDir.appendingPathComponent(".dsh")
                 do {
@@ -1501,7 +1501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func refreshUninstallLog() {
+    @objc private func refreshUninstallLog() {
         uninstallPanel?.updateLog(uninstallLogTail(30))
     }
 
@@ -1509,41 +1509,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uninstallLogTimer?.invalidate()
         uninstallLogTimer = nil
         uninstallInProgress = false
-        operationLock = false
+        busy = false
         invalidateDshInfo()   // 卸载完成，安装状态已变化，清除缓存
         latestRemoteVersion = nil
         updateAvailable = false
         updateIsPreview = false
+        runningProfile = nil
+        defaults.removeObject(forKey: "runningProfile")
         refresh()
 
         // 成功判定：退出码 0 且本地已检测不到 dsh（全局包与 npx 缓存都已清理）
         if code == 0 && !dshInstalled() {
             uninstallPanel?.setSuccess()
-            // 稍作停留展示“已卸载”，然后自动关闭面板；服务保持停止，
-            // 下次点「安装 dsh」即可重新走首次安装流程
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 self?.uninstallPanel?.close()
                 self?.uninstallPanel = nil
             }
         } else {
-            let tail = uninstallLogTail(20)
+            let tailText = uninstallLogTail(20)
             let detail = dshInstalled() ? "\n本地仍检测到 dsh（全局包或 npx 缓存未清干净）。" : ""
-            uninstallPanel?.setFailure("卸载失败（退出码 \(code)）\(detail)\n\n\(tail)")
+            uninstallPanel?.setFailure("卸载失败（退出码 \(code)）\(detail)\n\n\(tailText)")
         }
     }
 
     // MARK: dsh 更新（自动检测 + 一键升级）
 
-    /// 菜单「更新 dsh / 检查更新」：面板被最小化时先恢复显示
-    /// （菜单栏 App 无 Dock 图标，最小化后的窗口只能靠这里找回来）；
+    /// 「检查更新 / 更新 → vX」按钮：面板被最小化时先恢复显示；
     /// 已有可用更新则直接执行升级，否则手动检查一次。
-    @objc func checkUpdateTapped() {
+    func updateRequested() {
         if let panel = updatePanel, panel.isMiniaturized {
             panel.deminiaturize(nil)
             panel.orderFrontRegardless()
             panel.makeKey()
             return
         }
+        guard !checkingUpdates, !checkingGithub else { return } // 检查进行中忽略连点
         if updateAvailable {
             performUpdate()
         } else {
@@ -1551,59 +1551,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 每 6 小时定时自动检查（静默，不打扰）。
+    /// 每 6 小时定时自动检查（静默，不打扰；结果只在主窗口提示）。
     @objc func autoCheckUpdates() {
         checkForUpdates(notifyIfUpToDate: false)
     }
 
-    /// 查询 npm registry 最新版并与本地版本对比；发现新版本时仅更新菜单（不弹窗打扰），
-    /// 手动检查（notifyIfUpToDate）时反馈结果。
+    /// 双通道检查 dsh 更新：
+    /// · npm registry（latest + next dist-tag）—— 唯一可一键升级的渠道，仅已安装时检查；
+    /// · GitHub Releases —— 仅信息展示（npm 未发布的版本如 alpha 预发布在这里提示）。
+    /// 两条通道并行请求，各自回填 UI；手动检查（notifyIfUpToDate）时在 npm 结果
+    /// 落定后反馈一次（若 GitHub 频道有 npm 没有的版本，附在提示里）。
     func checkForUpdates(notifyIfUpToDate: Bool) {
         guard !updatingInProgress else { return }
-        guard let local = localDshVersion() else {
-            // 未安装 dsh 时无需检查更新（菜单项此时也隐藏）
-            latestRemoteVersion = nil
-            updateAvailable = false
-            refresh()
-            return
-        }
-        guard !checkingUpdates else { return }
-        checkingUpdates = true
+        guard !checkingUpdates, !checkingGithub else { return }
+        let local = localDshVersion()
+        checkingUpdates = (local != nil) // 未安装时 npm 无从对比，跳过；GitHub 频道照常
+        checkingGithub = true
         refresh()
-        fetchLatestDshVersion { [weak self] remote, isPreview in
+
+        var pending = 1 + (local != nil ? 1 : 0) // 等所有已发起的通道回落
+        func channelDone() {
+            pending -= 1
+            if pending == 0 { reportCheckResult(notify: notifyIfUpToDate, local: local) }
+        }
+
+        if local != nil {
+            fetchLatestDshVersion { [weak self] remote, isPreview in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.checkingUpdates = false
+                    self.npmLatestVersion = remote
+                    if let remote = remote, isNewerVersion(remote, than: local!) {
+                        self.latestRemoteVersion = remote
+                        self.updateIsPreview = isPreview
+                        self.updateAvailable = true
+                    } else {
+                        self.latestRemoteVersion = nil
+                        self.updateIsPreview = false
+                        self.updateAvailable = false
+                    }
+                    self.refresh()
+                    channelDone()
+                }
+            }
+        }
+
+        fetchLatestGithubRelease { [weak self] version, url, pre in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.checkingUpdates = false
-                if let remote = remote, isNewerVersion(remote, than: local) {
-                    // 发现新版本：菜单按钮变「更新 dsh → vX」作为提示，不打扰用户
-                    self.latestRemoteVersion = remote
-                    self.updateIsPreview = isPreview
-                    self.updateAvailable = true
-                } else {
-                    self.latestRemoteVersion = nil
-                    self.updateIsPreview = false
-                    self.updateAvailable = false
-                    if notifyIfUpToDate {
-                        if let remote = remote {
-                            self.showAlert(title: "已是最新版本",
-                                           message: "当前已安装 dsh \(local)，npm 最新版本也是 \(remote)。")
-                        } else {
-                            self.showAlert(title: "检查更新失败",
-                                           message: "无法连接 npm registry，请检查网络后重试。")
-                        }
-                    }
-                }
+                self.checkingGithub = false
+                self.githubLatestVersion = version
+                self.githubReleaseURL = url
+                self.githubIsPrerelease = pre
                 self.refresh()
+                channelDone()
             }
         }
     }
 
+    /// 手动检查的结果反馈（npm 频道为准；GitHub 频道仅附带提示）。
+    private func reportCheckResult(notify: Bool, local: String?) {
+        guard notify, let local = local else { return }
+        if updateAvailable { return } // 窗口已出现「更新 → vX」按钮，不打扰
+        guard let npmRemote = npmLatestVersion else {
+            showAlert(title: "检查更新失败",
+                      message: "无法连接 npm registry，请检查网络后重试。")
+            return
+        }
+        var message = "当前已安装 dsh \(local)，npm 最新版本是 \(npmRemote)。"
+        if let gh = githubLatestVersion, isNewerVersion(gh, than: local) {
+            message += "\n\nGitHub Release 有更新的版本 v\(gh)（npm 未发布），可在信息区点「查看 Release」了解。"
+        }
+        showAlert(title: "已是最新版本", message: message)
+    }
+
     /// 一键升级：安装检测到的目标版本（`npm install -g @deepseek-ai/dsh@<目标版本>`），
-    /// 进度面板实时展示日志，完成后自动重启服务加载新版。
+    /// 进度面板实时展示日志。更新前服务在跑 → 完成后自动重启加载新版；
+    /// 更新前停着 → 保持停止（不自动启动）。
     /// 注意：必须安装确切的目标版本（可能是 next 通道的 rc 版），不能写死 @latest，
-    /// 否则 latest 标签（如 rc.7）与检测目标（如 rc.8）不一致，会导致装完仍提示更新。
+    /// 否则 latest 标签与检测目标不一致，会导致装完仍提示更新。
     func performUpdate() {
-        guard !updatingInProgress, !operationLock else { return }
+        guard !updatingInProgress, !busy else { return }
         guard let target = latestRemoteVersion, !target.isEmpty else {
             showAlert(title: "无法更新 dsh",
                       message: "未找到目标更新版本，请先点击「检查更新」。")
@@ -1615,18 +1643,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                       message: "未找到 npm（Node.js 可能未安装）。")
             return
         }
+        let wasRunning = port3080IsDsh()
         updatingInProgress = true
-        operationLock = true
+        busy = true
         refresh()
 
-        // 清空旧更新日志，避免面板显示上一次的内容
         try? "".write(to: updateLogFile, atomically: true, encoding: .utf8)
 
         let panel = InstallPanel(panelTitle: "更新 dsh",
                                  statusTitle: "正在更新 dsh…",
                                  statusText: "正在下载并安装 \(target)…",
                                  doneTitle: "dsh 更新完成",
-                                 doneStatus: "即将自动重启服务…",
+                                 doneStatus: wasRunning ? "即将自动重启服务加载新版…" : "服务未在运行，已保持停止。",
                                  failTitle: "dsh 更新失败")
         updatePanel = panel
         panel.center()
@@ -1648,19 +1676,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let code = runProcessLogging(node, [npm, "install", "-g", pkg],
                                          timeout: 180, env: env, logURL: updateLogFile)
-            DispatchQueue.main.async { self?.updateFinished(code: code, target: target) }
+            DispatchQueue.main.async { self?.updateFinished(code: code, target: target, wasRunning: wasRunning) }
         }
     }
 
-    @objc func refreshUpdateLog() {
+    @objc private func refreshUpdateLog() {
         updatePanel?.updateLog(updateLogTail(30))
     }
 
-    private func updateFinished(code: Int32, target: String) {
+    private func updateFinished(code: Int32, target: String, wasRunning: Bool) {
         updateLogTimer?.invalidate()
         updateLogTimer = nil
         updatingInProgress = false
-        operationLock = false
+        busy = false
         invalidateDshInfo() // 升级完成，dsh 版本已变化，清除缓存
         refresh()
 
@@ -1672,25 +1700,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateAvailable = false
             updateIsPreview = false
             updatePanel?.setSuccess()
-            // 稍作停留展示“更新完成”，然后自动关闭面板并重启服务加载新版
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 self?.updatePanel?.close()
                 self?.updatePanel = nil
-                self?.launchService()
+                if wasRunning {
+                    self?.restartRequested() // 更新前在跑 → 重启加载新版
+                }
             }
         } else {
-            let tail = updateLogTail(20)
+            let tailText = updateLogTail(20)
             let detail = installed.map { "（当前本地版本：\($0)）" } ?? "（未检测到本地版本）"
-            updatePanel?.setFailure("更新失败（退出码 \(code)）\(detail)。\n\n\(tail)")
+            updatePanel?.setFailure("更新失败（退出码 \(code)）\(detail)。\n\n\(tailText)")
         }
     }
 
-    @objc func toggleAutoApp(_ item: NSMenuItem) {
-        let on = item.state == .off
+    // MARK: 设置
+
+    /// 登录时自动启动本 App（只影响 App 自己，不影响 dsh 服务）。
+    func setAutoApp(_ on: Bool) {
         if on {
             // 只写 plist，不 bootstrap：RunAtLoad=true 时 bootstrap 会立刻再拉起一个实例，
-            // 且 launchd 直启的进程无法被单实例守卫识别（见 applicationDidFinishLaunching），
-            // 导致菜单栏出现两个图标。launchd 会在下次登录时自动加载该 plist。
+            // 且 launchd 直启的进程无法被单实例守卫识别，导致菜单栏出现两个图标。
+            // launchd 会在下次登录时自动加载该 plist。
             if writePlist(appPlistURL, appPlistXML()) {
                 // 清理旧版本可能已 bootstrap 的 agent（未加载时无副作用）
                 launchctl(["bootout", "\(guiDomain)/\(appLabel)"])
@@ -1702,99 +1733,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    @objc func showDataDir() {
-        NSWorkspace.shared.open(homeDir.appendingPathComponent(".dsh"))
+    // MARK: 服务日志流（主窗口日志区）
+
+    func startLogStream() {
+        guard logStreamTimer == nil else { return }
+        updateLogText()
+        let t = Timer(timeInterval: 1, target: self, selector: #selector(updateLogText), userInfo: nil, repeats: true)
+        RunLoop.main.add(t, forMode: .common)
+        logStreamTimer = t
     }
 
-    @objc func quitApp() {
-        NSApp.terminate(nil)
+    func stopLogStream() {
+        logStreamTimer?.invalidate()
+        logStreamTimer = nil
     }
 
-    /// 退出前停止服务：先 bootout 停掉 App 托管的 launchd 任务，
-    /// 再杀掉 3080 端口上的 **dsh** 进程（覆盖外部实例/孤儿进程，保证退出后 dsh 必停）。
-    /// 注意：只杀 dsh，绝不碰非 dsh 程序（契约是「退出停止 dsh 服务」）。
-    /// 被单实例守卫淘汰的重复实例不执行此逻辑。
-    func applicationWillTerminate(_ notification: Notification) {
-        if !isDuplicateExit {
-            stopService()
-            // bootout 是异步卸载：等待任务完全消失再退出，避免服务进程残留（最多等 1 秒）
-            for _ in 0..<10 where serviceLoaded() { usleep(100_000) }
-            killDshOnPort3080()
-        }
+    @objc private func updateLogText() {
+        logText = tail(of: logFile, n: 40, placeholder: "(暂无服务日志 —— 服务启动后这里会实时显示输出)")
     }
 
-    @objc func refresh() {
-        let state = serviceState()
-        // shell 环境抓取失败时给出提示：服务能跑，但终端工具链（node/npm 等）可能不可用
-        let envNote = lastEnvCaptureFailed ? "（⚠ shell 环境抓取失败，工具链可能不可用）" : ""
-        switch state {
-        case .running: statusLine.title = "服务：运行中 · 端口 3080\(envNote)"
-        case .starting: statusLine.title = "服务：正在启动…"
-        case .installing: statusLine.title = "服务：dsh 安装中…"
-        case .notInstalled: statusLine.title = "服务：dsh 未安装"
-        case .portBusy: statusLine.title = "服务：端口 3080 被其他程序占用"
-        case .crashed: statusLine.title = "服务：dsh 异常退出，launchd 正在自动重启…"
-        case .stopped: statusLine.title = "服务：未运行\(envNote)"
-        }
-        // 「安装 dsh」：仅未安装/安装失败时显示；安装中禁用并改名
-        if installInProgress {
-            installItem.title = "dsh 安装中…"
-            installItem.isEnabled = false
-            installItem.isHidden = false
-        } else if state == .notInstalled {
-            installItem.title = "安装 dsh"
-            installItem.isEnabled = true
-            installItem.isHidden = false
-        } else {
-            installItem.isHidden = true
-        }
-        // 「卸载 dsh」：仅已安装时显示；卸载中禁用并改名；安装/更新进行中隐藏（状态不稳定）
-        if uninstallInProgress {
-            uninstallItem.title = "dsh 卸载中…"
-            uninstallItem.isEnabled = false
-            uninstallItem.isHidden = false
-        } else if dshInstalled(), !installInProgress, !updatingInProgress {
-            uninstallItem.title = "卸载 dsh"
-            uninstallItem.isEnabled = true
-            uninstallItem.isHidden = false
-        } else {
-            uninstallItem.isHidden = true
-        }
-        // 服务未安装时重启/打开 UI 不可用
-        restartItem.isEnabled = state != .notInstalled
-        openItem.isEnabled = state != .notInstalled && state != .installing
-        // 「更新 dsh / 检查更新」：dsh 未安装时隐藏；升级中/检查中禁用并改名
-        if !dshInstalled() {
-            updateItem.isHidden = true
-        } else if updatingInProgress {
-            updateItem.title = "dsh 更新中…"
-            updateItem.isEnabled = false
-            updateItem.isHidden = false
-        } else if checkingUpdates {
-            updateItem.title = "检查更新…"
-            updateItem.isEnabled = false
-            updateItem.isHidden = false
-        } else if updateAvailable, let remote = latestRemoteVersion {
-            // 预发布通道（next 标签）的目标版本标注「预发布」，让用户知情再决定是否升级
-            updateItem.title = updateIsPreview
-                ? "更新 dsh → v\(remote)（预发布）"
-                : "更新 dsh → v\(remote)"
-            updateItem.isEnabled = true
-            updateItem.isHidden = false
-        } else {
-            updateItem.title = "检查更新"
-            updateItem.isEnabled = true
-            updateItem.isHidden = false
-        }
-        // 当前 dsh 版本（未安装时显示“未安装”）
-        if let v = localDshVersion() {
-            versionItem.title = "dsh 版本：v\(v)"
-        } else {
-            versionItem.title = "dsh 版本：未安装"
-        }
-        autoAppItem.state = appAutoStartEnabled() ? .on : .off
-        updateDot(state)
-    }
+    // MARK: 弹窗队列
 
     private var pendingAlerts: [(title: String, message: String)] = []
     private var alertShowing = false
@@ -1818,7 +1776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = next.title
         alert.informativeText = next.message
         alert.addButton(withTitle: "好")
-        // 延迟到下一个 runloop 展示，避免阻塞当前调用栈；菜单栏 App 无主窗口，不能用 sheet
+        // 延迟到下一个 runloop 展示，避免阻塞当前调用栈
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             alert.runModal()
             self?.alertShowing = false
@@ -1827,6 +1785,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
+
+// MARK: - App 主体（菜单栏 + 主窗口宿主）
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var mainWindow: NSWindow?
+    private var openWebItem: NSMenuItem!
+    private let model = AppModel.shared
+    private var cancellables = Set<AnyCancellable>()
+    private var whaleIconCache: [ServiceState: NSImage] = [:]
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 单实例守卫：菜单栏 App 重复打开会出现多个图标，保留最早的那个。
+        // 不能用 bundle id 查询（launchd 直启的进程可能无法关联 bundle），
+        // 改为按"可执行文件路径相同"匹配所有运行中的应用。
+        let myExe = Bundle.main.executableURL?.standardizedFileURL.path
+        let myBundleId = Bundle.main.bundleIdentifier
+        let dupes = NSWorkspace.shared.runningApplications.filter {
+            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier &&
+            (($0.bundleIdentifier != nil && $0.bundleIdentifier == myBundleId) ||
+             $0.executableURL?.standardizedFileURL.path == myExe)
+        }
+        if !dupes.isEmpty {
+            let earliest = dupes.min { ($0.launchDate ?? .distantPast) < ($1.launchDate ?? .distantPast) }
+            if let earliest, (earliest.launchDate ?? .distantPast) < (NSRunningApplication.current.launchDate ?? .distantPast) {
+                NSApp.terminate(nil)
+                return
+            }
+        }
+        NSApp.setActivationPolicy(.accessory)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        buildMenu()
+        model.refresh()
+        updateStatusIcon()
+        model.startTimers()
+        // 状态变化 → 菜单栏图标着色与「打开 Web」可用性
+        model.$state.receive(on: RunLoop.main).sink { [weak self] _ in
+            self?.updateStatusIcon()
+        }.store(in: &cancellables)
+        // 静默检查 dsh 更新：启动 10 秒后查一次，之后每 6 小时（结果只在主窗口提示）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.model.checkForUpdates(notifyIfUpToDate: false)
+        }
+        // 首次使用（dsh 未安装）自动打开主窗口引导安装
+        if !dshInstalled() {
+            showMainWindow()
+        }
+    }
+
+    private func buildMenu() {
+        let menu = NSMenu()
+        menu.autoenablesItems = false // 手动控制 isEnabled（默认自动校验会忽略禁用）
+        openWebItem = NSMenuItem(title: "打开 Web", action: #selector(openUI), keyEquivalent: "o")
+        openWebItem.target = self
+        menu.addItem(openWebItem)
+        let winItem = NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow), keyEquivalent: "")
+        winItem.target = self
+        menu.addItem(winItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 App", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem.menu = menu
+    }
+
+    /// 按状态缓存着色的鲸鱼图标（避免每 5 秒重新渲染位图）。
+    private func cachedWhaleIcon(_ state: ServiceState) -> NSImage? {
+        if let img = whaleIconCache[state] { return img }
+        let color: NSColor = {
+            switch state {
+            case .running: return .systemGreen
+            case .starting, .installing, .notInstalled: return .systemGray
+            case .portBusy: return .systemOrange
+            case .crashed: return .systemRed
+            case .stopped: return .systemGray
+            }
+        }()
+        guard let img = whaleMenuImage(color: color) else { return nil }
+        whaleIconCache[state] = img
+        return img
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem.button else { return }
+        let state = model.state
+        if let image = cachedWhaleIcon(state) {
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.attributedTitle = NSAttributedString(string: "")
+        } else {
+            // 兜底：图标资源缺失时退回旧圆点
+            let (char, color): (String, NSColor) = {
+                switch state {
+                case .running: return ("●", .systemGreen)
+                case .starting, .installing, .notInstalled: return ("◌", .systemGray)
+                case .portBusy: return ("◍", .systemOrange)
+                case .crashed: return ("✕", .systemRed)
+                case .stopped: return ("○", .systemGray)
+                }
+            }()
+            button.attributedTitle = NSAttributedString(string: char, attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: color
+            ])
+        }
+        // 服务在跑才能打开 Web；未运行时置灰（主窗口可启动服务）
+        openWebItem?.isEnabled = (state == .running)
+    }
+
+    @objc func openUI() {
+        model.openWeb()
+    }
+
+    /// 显示主窗口（单例：关窗仅隐藏，可随时找回）
+    @objc func showMainWindow() {
+        if mainWindow == nil {
+            mainWindow = MainWindowFactory.makeWindow()
+        }
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func quitApp() {
+        NSApp.terminate(nil)
+    }
+
+    // 注意：没有 applicationWillTerminate 停服逻辑 —— v2.0 起服务是独立的
+    // LaunchAgent（全手动控制），退出 App 不影响服务运行。
+}
+
+// MARK: - 入口
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

@@ -13,6 +13,7 @@ echo "== 编译 App =="
 swiftc -O -target arm64-apple-macos13.0 \
     -o "$APP/Contents/MacOS/DSHLauncher" \
     Sources/main.swift \
+    Sources/MainWindow.swift \
     -framework AppKit
 
 echo "== Info.plist / 资源 =="
