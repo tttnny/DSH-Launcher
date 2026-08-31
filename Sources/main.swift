@@ -1165,6 +1165,17 @@ final class AppModel: NSObject, ObservableObject {
     @Published var npmLatestVersion: String?
     @Published var npmIsPrerelease = false
     @Published var npmTag: String?
+    /// 用户主动忽略的升级版本（等上游修复期间避免误点升级）；
+    /// 忽略后该版本不再亮「更新」按钮，npm 信息区照常展示。
+    @Published var ignoredUpgradeVersion: String? {
+        didSet {
+            if let v = ignoredUpgradeVersion { defaults.set(v, forKey: "ignoredUpgradeVersion") }
+            else { defaults.removeObject(forKey: "ignoredUpgradeVersion") }
+        }
+    }
+
+    /// 最近一次启动/重启失败的详细原因（主窗口展示，不弹模态窗）
+    @Published var lastStartError: String?
 
     // dsh 更新（GitHub Release 频道：仅信息展示 + 跳转，npm 未发布的版本装不了）
     @Published var githubLatestVersion: String?
@@ -1195,6 +1206,7 @@ final class AppModel: NSObject, ObservableObject {
         let saved = defaults.string(forKey: "selectedProfile")
         selectedProfile = saved ?? "web"
         super.init()
+        ignoredUpgradeVersion = defaults.string(forKey: "ignoredUpgradeVersion")
         runningProfile = defaults.string(forKey: "runningProfile")
     }
 
@@ -1330,13 +1342,12 @@ final class AppModel: NSObject, ObservableObject {
         }
     }
 
-    /// 结束"正在启动"状态：失败时弹日志尾部，随后刷新 UI。
+    /// 结束"正在启动"状态：失败时不弹模态窗（accessory 应用里模态窗常无法获得焦点），
+    /// 只在主窗口展示失败摘要，详情看服务日志区。
     private func finishStartup(ok: Bool, message: String?) {
         isStarting = false
         busy = false
-        if !ok, let message = message {
-            showAlert(title: "服务启动失败", message: message)
-        }
+        lastStartError = ok ? nil : message
         refresh()
     }
 
@@ -1580,6 +1591,23 @@ final class AppModel: NSObject, ObservableObject {
 
     // MARK: dsh 更新（自动检测 + 一键升级）
 
+    /// 忽略当前可更新版本（等上游修复期间避免误升级）；忽略后不再亮「更新」按钮。
+    func ignoreLatestUpgrade() {
+        guard let v = latestRemoteVersion else { return }
+        ignoredUpgradeVersion = v
+        updateAvailable = false
+        latestRemoteVersion = nil
+        updateIsPreview = false
+        refresh()
+    }
+
+    /// 取消忽略：恢复对该版本升级的提示。
+    func unignoreUpgrade() {
+        ignoredUpgradeVersion = nil
+        refresh()
+        checkForUpdates(notifyIfUpToDate: false) // 重新按当前状态亮按钮
+    }
+
     /// 「检查更新 / 更新 → vX」按钮：面板被最小化时先恢复显示；
     /// 已有可用更新则直接执行升级，否则手动检查一次。
     func updateRequested() {
@@ -1628,7 +1656,12 @@ final class AppModel: NSObject, ObservableObject {
                 self.npmLatestVersion = remote
                 self.npmIsPrerelease = isPreview
                 self.npmTag = tag
-                if let local = local, let remote = remote, isNewerVersion(remote, than: local) {
+                // 用户忽略过的版本：信息区照常展示，但不再亮「更新」按钮
+                if let ignored = self.ignoredUpgradeVersion, let remote = remote, ignored == remote {
+                    self.latestRemoteVersion = nil
+                    self.updateIsPreview = false
+                    self.updateAvailable = false
+                } else if let local = local, let remote = remote, isNewerVersion(remote, than: local) {
                     self.latestRemoteVersion = remote
                     self.updateIsPreview = isPreview
                     self.updateAvailable = true

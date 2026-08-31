@@ -197,6 +197,12 @@ struct MainWindowView: View {
         return isNewerVersion(v, than: npm)
     }
 
+    /// 启动失败摘要：取 message 第一段（去掉"日志尾部"等冗余）
+    private func errSummary(_ message: String) -> String {
+        let first = message.components(separatedBy: "\n\n").first ?? message
+        return first.replacingOccurrences(of: "\n", with: " ")
+    }
+
     private var dshInstallLocation: String {
         guard let path = resolveDshLauncher(nodePath: resolveNodePath()) else { return "未安装" }
         return abbreviateHome(path)
@@ -266,7 +272,13 @@ struct MainWindowView: View {
                     updateButton
                     Spacer()
                 }
-                if model.state == .crashed {
+                if let err = model.lastStartError {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("上次启动失败，可点「重启」重试；详见下方服务日志").font(.caption).foregroundColor(.red)
+                        Text(errSummary(err)).font(.caption2).foregroundColor(.secondary)
+                            .lineLimit(2).truncationMode(.tail)
+                    }
+                } else if model.state == .crashed {
                     Text("服务进程异常退出且不会自动重启（崩溃不自愈），可点「重启」重新拉起；详见服务日志。")
                         .font(.caption).foregroundColor(.red)
                 }
@@ -298,13 +310,31 @@ struct MainWindowView: View {
                 }
                 .disabled(true)
             } else if model.updateAvailable, let v = model.latestRemoteVersion {
-                Button {
-                    model.updateRequested()
-                } label: {
-                    Text(model.updateIsPreview ? "更新 → v\(v)（预发布）" : "更新 → v\(v)")
+                HStack(spacing: 6) {
+                    Button {
+                        model.updateRequested()
+                    } label: {
+                        Text(model.updateIsPreview ? "更新 → v\(v)（预发布）" : "更新 → v\(v)")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    // 等上游修复期间可忽略该版本，避免误点升级又踩到不兼容
+                    Button("忽略此版本") {
+                        model.ignoreLatestUpgrade()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
+            } else if let ignored = model.ignoredUpgradeVersion {
+                HStack(spacing: 4) {
+                    Text("已忽略更新 v\(ignored)").font(.caption).foregroundColor(.secondary)
+                    Button("取消") {
+                        model.unignoreUpgrade()
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
             } else {
                 Button("检查更新") {
                     model.updateRequested()

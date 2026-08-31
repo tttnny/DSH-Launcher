@@ -53,8 +53,9 @@ The service process inherits your terminal's zsh environment (PATH etc.), so the
 | Restart | Stops and re-launches with the current profile, no confirmation |
 | Stop | Stops the service (`launchctl bootout` + killing any dsh left on the port); stays stopped until started manually |
 | Crash | Red "crashed" state; **no auto-restart** — click Restart to bring it back |
+| Start failure | **No modal dialog**; the Service control section shows a failure summary, details in the log section, click Restart to retry |
 | Quit / reopen the app | Service keeps running / is not auto-started; the main window buttons are the single source of truth |
-| Update dsh | If the service was running before the update it restarts automatically; if it was stopped it stays stopped |
+| Update dsh | If the service was running before the update it restarts automatically; if it was stopped it stays stopped; "Ignore this version" skips an unwanted upgrade (e.g. while waiting for an upstream fix) |
 
 ### About profiles
 
