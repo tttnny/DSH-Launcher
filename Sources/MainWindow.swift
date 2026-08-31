@@ -96,7 +96,7 @@ struct MainWindowView: View {
                 }
                 Divider()
                 infoRow("dsh 版本", model.localVersion.map { "v\($0)" } ?? "未安装")
-                infoRow("npm 最新版", model.npmLatestVersion.map { "v\($0)" } ?? "未检查")
+                npmRow
                 githubRow
                 infoRow("运行 Profile",
                         model.state == .running
@@ -120,6 +120,30 @@ struct MainWindowView: View {
             Text(value)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 12))
+    }
+
+    /// npm 频道行：最新版本 + 预发布/tag 徽标
+    private var npmRow: some View {
+        HStack(alignment: .top) {
+            Text("npm 最新版")
+                .foregroundColor(.secondary)
+                .frame(width: 76, alignment: .leading)
+            if let v = model.npmLatestVersion {
+                HStack(spacing: 6) {
+                    Text("v\(v)").textSelection(.enabled)
+                    if model.npmIsPrerelease {
+                        let tagLabel = model.npmTag.flatMap { $0 != "latest" ? $0 : nil } ?? "预发布"
+                        captionBadge(tagLabel)
+                    }
+                }
+                Spacer()
+            } else {
+                Text(model.checkingUpdates ? "获取中…" : "未检查")
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
         }
         .font(.system(size: 12))
     }

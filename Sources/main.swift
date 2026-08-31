@@ -88,7 +88,8 @@ func cleanDshStagingResidue() {
     guard nodeDir != "/usr/bin" else { return }
     let scopeDir = (nodeDir as NSString).deletingLastPathComponent + "/lib/node_modules/@deepseek-ai"
     guard let entries = try? fs.contentsOfDirectory(atPath: scopeDir) else { return }
-    for e in entries where e != "dsh" {
+    // 仅清理 npm 中断留下的隐藏临时目录（如 .dsh-Attf9w6e 或 .dsh.DELETE 等），不误删同一 scope 下的其他合法包
+    for e in entries where e.hasPrefix(".dsh-") || (e.hasPrefix(".") && e.contains("dsh")) {
         try? fs.removeItem(atPath: "\(scopeDir)/\(e)")
     }
 }
@@ -537,7 +538,9 @@ func localDshVersionUncached(node: String) -> String? {
 /// - 忽略 `+build` 后缀（按 spec build 不参与排序）
 func isNewerVersion(_ a: String, than b: String) -> Bool {
     // 解析为 (核心号 [Int], prerelease 标识 [String])
-    func parse(_ v: String) -> ([Int], [String]) {
+    func parse(_ raw: String) -> ([Int], [String]) {
+        var v = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.hasPrefix("v") || v.hasPrefix("V") { v.removeFirst() }
         let main = v.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
         let core = String(main[0]).split(separator: ".").compactMap { Int($0) }
         let pre = main.count > 1 ? String(main[1]) : ""
@@ -584,31 +587,61 @@ func isNewerVersion(_ a: String, than b: String) -> Bool {
 }
 
 /// 查询 npm registry 上 @deepseek-ai/dsh 的目标更新版本；失败（网络/解析）返回 nil。
-/// 同时考虑 `latest`（稳定通道）与 `next`（预发布通道）两个 dist-tag，取其中版本更高者，
-/// 这样 rc/alpha/beta 等 pre-release（如 0.1.0-rc.8，挂在 next 标签）也能被检测到。
-/// 返回 `(版本, 是否来自 next 预发布通道)`，用于 UI 标注，让用户知情。
-func fetchLatestDshVersion(completion: @escaping (String?, Bool) -> Void) {
+/// 遍历所有 dist-tag（latest, next, alpha, beta, rc, canary 等）以及 versions 列表，取最高语义版本。
+/// 返回 `(版本, 是否预发布通道, 对应的 tag 名称)`。
+func fetchLatestDshVersion(completion: @escaping (_ version: String?, _ isPreview: Bool, _ tag: String?) -> Void) {
     var req = URLRequest(url: npmRegistryURL)
     req.timeoutInterval = 10
     URLSession.shared.dataTask(with: req) { data, _, error in
         guard error == nil, let data = data,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tags = obj["dist-tags"] as? [String: Any] else {
-            completion(nil, false)
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            completion(nil, false, nil)
             return
         }
+        let tags = obj["dist-tags"] as? [String: Any] ?? [:]
         let latest = tags["latest"] as? String
-        let next = tags["next"] as? String
-        // 候选：latest 优先；next 仅在与 latest 不同时参与比较（同版本时视为稳定通道）
-        var best: String? = latest
-        var fromNext = false
-        if let next = next, !next.isEmpty, next != latest {
-            if best == nil || isNewerVersion(next, than: best!) {
-                best = next
-                fromNext = true
+
+        // 收集所有候选版本（来自所有 dist-tag 以及 versions 字典）
+        var candidateVersions = Set<String>()
+        for (_, val) in tags {
+            if let v = val as? String, !v.isEmpty {
+                candidateVersions.insert(v)
             }
         }
-        completion(best, fromNext)
+        if let versionsDict = obj["versions"] as? [String: Any] {
+            for v in versionsDict.keys where !v.isEmpty {
+                candidateVersions.insert(v)
+            }
+        }
+
+        // 挑选最高语义版本
+        var best: String? = latest
+        for v in candidateVersions {
+            if best == nil || isNewerVersion(v, than: best!) {
+                best = v
+            }
+        }
+
+        guard let bestVersion = best else {
+            completion(nil, false, nil)
+            return
+        }
+
+        let isPreview = (latest == nil || bestVersion != latest)
+        // 查找对应的 tag 名称（优先非 latest 的 tag，例如 "alpha", "next"）
+        var matchedTag: String? = nil
+        for (tagKey, val) in tags {
+            if let v = val as? String, v == bestVersion {
+                if tagKey != "latest" {
+                    matchedTag = tagKey
+                    break
+                } else if matchedTag == nil {
+                    matchedTag = "latest"
+                }
+            }
+        }
+
+        completion(bestVersion, isPreview, matchedTag)
     }.resume()
 }
 
@@ -628,8 +661,19 @@ func fetchLatestGithubRelease(completion: @escaping (_ version: String?, _ url: 
         }
         var best: (version: String, url: String, pre: Bool)? = nil
         for item in list {
-            guard let tag = item["tag_name"] as? String, tag.hasPrefix("dsh-v") else { continue }
-            let v = String(tag.dropFirst("dsh-v".count))
+            guard let tag = item["tag_name"] as? String else { continue }
+            // 兼容多种 tag 命名：dsh-v0.1.2、dsh@0.1.2、v0.1.2、0.1.2
+            var v = tag
+            if v.hasPrefix("dsh-v") {
+                v = String(v.dropFirst("dsh-v".count))
+            } else if v.hasPrefix("dsh@v") {
+                v = String(v.dropFirst("dsh@v".count))
+            } else if v.hasPrefix("dsh@") {
+                v = String(v.dropFirst("dsh@".count))
+            } else if v.hasPrefix("v") || v.hasPrefix("V") {
+                v = String(v.dropFirst(1))
+            }
+            guard !v.isEmpty else { continue }
             let url = item["html_url"] as? String ?? "https://github.com/deepseek-ai/deepseek-harness/releases"
             let pre = item["prerelease"] as? Bool ?? true
             if best == nil || isNewerVersion(v, than: best!.version) {
@@ -1119,6 +1163,8 @@ final class AppModel: NSObject, ObservableObject {
     @Published var updatingInProgress = false
     /// npm registry 上实际最新版本（不区分是否比本地新，供信息区展示）
     @Published var npmLatestVersion: String?
+    @Published var npmIsPrerelease = false
+    @Published var npmTag: String?
 
     // dsh 更新（GitHub Release 频道：仅信息展示 + 跳转，npm 未发布的版本装不了）
     @Published var githubLatestVersion: String?
@@ -1557,7 +1603,7 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     /// 双通道检查 dsh 更新：
-    /// · npm registry（latest + next dist-tag）—— 唯一可一键升级的渠道，仅已安装时检查；
+    /// · npm registry（遍历所有 dist-tag 与 versions 列表）—— 唯一可一键升级的渠道；
     /// · GitHub Releases —— 仅信息展示（npm 未发布的版本如 alpha 预发布在这里提示）。
     /// 两条通道并行请求，各自回填 UI；手动检查（notifyIfUpToDate）时在 npm 结果
     /// 落定后反馈一次（若 GitHub 频道有 npm 没有的版本，附在提示里）。
@@ -1565,34 +1611,34 @@ final class AppModel: NSObject, ObservableObject {
         guard !updatingInProgress else { return }
         guard !checkingUpdates, !checkingGithub else { return }
         let local = localDshVersion()
-        checkingUpdates = (local != nil) // 未安装时 npm 无从对比，跳过；GitHub 频道照常
+        checkingUpdates = true
         checkingGithub = true
         refresh()
 
-        var pending = 1 + (local != nil ? 1 : 0) // 等所有已发起的通道回落
+        var pending = 2 // 等待 npm 和 GitHub 两条通道都回落
         func channelDone() {
             pending -= 1
             if pending == 0 { reportCheckResult(notify: notifyIfUpToDate, local: local) }
         }
 
-        if local != nil {
-            fetchLatestDshVersion { [weak self] remote, isPreview in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    self.checkingUpdates = false
-                    self.npmLatestVersion = remote
-                    if let remote = remote, isNewerVersion(remote, than: local!) {
-                        self.latestRemoteVersion = remote
-                        self.updateIsPreview = isPreview
-                        self.updateAvailable = true
-                    } else {
-                        self.latestRemoteVersion = nil
-                        self.updateIsPreview = false
-                        self.updateAvailable = false
-                    }
-                    self.refresh()
-                    channelDone()
+        fetchLatestDshVersion { [weak self] remote, isPreview, tag in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.checkingUpdates = false
+                self.npmLatestVersion = remote
+                self.npmIsPrerelease = isPreview
+                self.npmTag = tag
+                if let local = local, let remote = remote, isNewerVersion(remote, than: local) {
+                    self.latestRemoteVersion = remote
+                    self.updateIsPreview = isPreview
+                    self.updateAvailable = true
+                } else {
+                    self.latestRemoteVersion = nil
+                    self.updateIsPreview = false
+                    self.updateAvailable = false
                 }
+                self.refresh()
+                channelDone()
             }
         }
 
@@ -1688,7 +1734,6 @@ final class AppModel: NSObject, ObservableObject {
         updateLogTimer?.invalidate()
         updateLogTimer = nil
         updatingInProgress = false
-        busy = false
         invalidateDshInfo() // 升级完成，dsh 版本已变化，清除缓存
         refresh()
 
@@ -1700,14 +1745,18 @@ final class AppModel: NSObject, ObservableObject {
             updateAvailable = false
             updateIsPreview = false
             updatePanel?.setSuccess()
+            // 保持 busy = true 直到面板关闭并触发重启（若需要），防止 1 秒展示期内的并发操作
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.updatePanel?.close()
-                self?.updatePanel = nil
+                guard let self = self else { return }
+                self.updatePanel?.close()
+                self.updatePanel = nil
+                self.busy = false
                 if wasRunning {
-                    self?.restartRequested() // 更新前在跑 → 重启加载新版
+                    self.restartRequested() // 更新前在跑 → 重启加载新版
                 }
             }
         } else {
+            busy = false
             let tailText = updateLogTail(20)
             let detail = installed.map { "（当前本地版本：\($0)）" } ?? "（未检测到本地版本）"
             updatePanel?.setFailure("更新失败（退出码 \(code)）\(detail)。\n\n\(tailText)")
