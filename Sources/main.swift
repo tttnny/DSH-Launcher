@@ -119,6 +119,26 @@ func removeNpxCachedDsh() {
     }
 }
 
+/// 卸载后清理 `@deepseek-ai` 作用域残留：npm uninstall -g 移除 dsh 后，
+/// 作用域目录常残留空壳（用户看到的"卸载不干净"），个别情况还会留下
+/// `.package-lock.json` / `package-lock.json` 辅助文件。
+/// 只清辅助文件与空壳目录，绝不碰同作用域下其他合法包。卸载流程收尾时调用。
+func cleanDshScopeResidue(node: String) {
+    let nodeDir = (node as NSString).deletingLastPathComponent
+    guard nodeDir != "/usr/bin" else { return }
+    let scopeDir = (nodeDir as NSString).deletingLastPathComponent + "/lib/node_modules/@deepseek-ai"
+    guard let entries = try? fs.contentsOfDirectory(atPath: scopeDir) else { return }
+    for e in entries where e == ".package-lock.json" || e == "package-lock.json" {
+        try? fs.removeItem(atPath: "\(scopeDir)/\(e)")
+        appendToUninstallLog("已清理作用域残留文件：\(scopeDir)/\(e)")
+    }
+    // 作用域已空 → 移除空壳目录（重装时 npm 会重建）
+    if (try? fs.contentsOfDirectory(atPath: scopeDir))?.isEmpty == true {
+        try? fs.removeItem(atPath: scopeDir)
+        appendToUninstallLog("已清理 npm 卸载后的空作用域目录：\(scopeDir)")
+    }
+}
+
 // MARK: - dsh 官方鲸鱼图标（菜单栏状态图标）
 // 直接解析打包在 App 内的官方 favicon.svg（DeepSeek Harness 源码
 // apps/web/public/favicon.svg，即 @deepseek-ai/dsh-web-frontend/dist/favicon.svg），
@@ -1538,9 +1558,11 @@ final class AppModel: NSObject, ObservableObject {
             }
             let code = runProcessLogging(node, [npm, "uninstall", "-g", "@deepseek-ai/dsh"],
                                          timeout: 120, env: env, logURL: uninstallLogFile)
-            // 3. 收尾清理：npm 残留临时目录 + npx 缓存里的 dsh（保证回到「未安装」状态）
+            // 3. 收尾清理：npm 残留临时目录 + npx 缓存里的 dsh + 作用域空壳残留
+            //    （保证回到「未安装」状态且不留文件）
             cleanDshStagingResidue()
             removeNpxCachedDsh()
+            cleanDshScopeResidue(node: node)
             // 4. 完全卸载：删除数据目录 ~/.dsh 与服务 LaunchAgent 配置
             if fullWipe {
                 let dataDir = homeDir.appendingPathComponent(".dsh")
